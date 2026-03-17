@@ -1,0 +1,16 @@
+# User data — NEVER overwrite
+.env
+alerts.db
+alerts.db-journal
+alerts.db-wal
+approved_users.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
