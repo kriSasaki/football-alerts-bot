@@ -5,6 +5,15 @@ alerts.db-journal
 alerts.db-wal
 approved_users.json
 
+# Logs
+logs/
+
+# Backups
+backups/
+
+# NSSM
+nssm.exe
+
 # Python
 __pycache__/
 *.pyc

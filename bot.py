@@ -9,9 +9,13 @@ Features:
   - Q1Q2 even alerts for basketball
 """
 import logging
+import logging.handlers
 import asyncio
 import time
+import os
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
@@ -36,11 +40,78 @@ from alert_engine import (
     format_alert_summary, format_live_alert_status,
 )
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=logging.INFO,
+# ═══════════════════════════════════════════════════════
+#  LOGGING SETUP — console + rotating file
+# ═══════════════════════════════════════════════════════
+
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+
+_log_format = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+
+# Console handler
+_console_h = logging.StreamHandler(sys.stdout)
+_console_h.setFormatter(_log_format)
+_console_h.setLevel(logging.INFO)
+
+# Rotating file handler: 5 MB per file, keep last 5 files
+_file_h = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "bot.log",
+    maxBytes=5 * 1024 * 1024,  # 5 MB
+    backupCount=5,
+    encoding="utf-8",
 )
+_file_h.setFormatter(_log_format)
+_file_h.setLevel(logging.DEBUG)  # file gets DEBUG too
+
+# Error-only file for quick scanning
+_err_h = logging.handlers.RotatingFileHandler(
+    _LOG_DIR / "errors.log",
+    maxBytes=2 * 1024 * 1024,  # 2 MB
+    backupCount=3,
+    encoding="utf-8",
+)
+_err_h.setFormatter(_log_format)
+_err_h.setLevel(logging.WARNING)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    handlers=[_console_h, _file_h, _err_h],
+)
+
+# Quiet noisy libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
+logging.getLogger("apscheduler").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
+
+# ═══════════════════════════════════════════════════════
+#  SAFE TELEGRAM EDIT (suppress common errors)
+# ═══════════════════════════════════════════════════════
+
+async def _safe_edit(query, text: str, keyboard=None):
+    """Edit message text, silently ignoring 'not modified' and timeout errors."""
+    try:
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=keyboard)
+    except Exception as e:
+        err_str = str(e)
+        if "Message is not modified" in err_str:
+            pass  # Same content — ignore
+        elif "Timed out" in err_str:
+            # Retry once with a fresh message instead of edit
+            try:
+                await query.message.reply_text(
+                    text, parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard)
+            except Exception:
+                pass
+        else:
+            raise
+
 
 DAY_NAMES = {
     0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг",
@@ -125,7 +196,7 @@ async def _show_sport_menu(query, sport: str):
         [InlineKeyboardButton("📋 Мои алерты", callback_data="myalerts:0")],
         [InlineKeyboardButton("« Назад", callback_data="main_menu")],
     ])
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await _safe_edit(query, text, keyboard)
 
 
 # ═══════════════════════════════════════════════════════
@@ -221,7 +292,7 @@ async def _show_day(query, sport: str, day_offset: int):
     buttons.extend(_day_nav_buttons(sport, day_offset))
     buttons.append([InlineKeyboardButton("« Назад", callback_data=f"sport:{sport}")])
 
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+    await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
 
 
 def _day_nav_buttons(sport, day_offset):
@@ -315,7 +386,7 @@ async def _show_live(query, sport: str):
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:4000] + "\n\n..."
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+    await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
 
 
 # ═══════════════════════════════════════════════════════
@@ -347,7 +418,7 @@ async def _show_match(query, sport, match_id):
     ])
     if len(text) > 4000:
         text = text[:4000]
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await _safe_edit(query, text, keyboard)
 
 
 def _format_football_detail(ev, stats):
@@ -912,6 +983,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.HTML)
                 except: pass
     except Exception as e:
+        err_str = str(e)
+        # Skip known non-critical errors
+        if "Message is not modified" in err_str or "Query is too old" in err_str:
+            return
+        if "Timed out" in err_str:
+            logger.warning("Callback timeout [%s]", data)
+            return
         logger.error("Callback error [%s]: %s", data, e, exc_info=True)
         try:
             await query.edit_message_text(f"❌ Ошибка: {e}\n\nПопробуй /start")
