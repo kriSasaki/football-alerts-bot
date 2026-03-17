@@ -1376,7 +1376,13 @@ def main():
 
     logger.info("Polling every %d sec via SofaScore", POLL_INTERVAL_SECONDS)
     logger.info("Starting Sports Alerts Bot v2 (SofaScore)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # bootstrap_retries=-1 = retry forever until connected
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        bootstrap_retries=-1,
+        read_timeout=60,
+        connect_timeout=60,
+    )
 
 
 if __name__ == "__main__":
