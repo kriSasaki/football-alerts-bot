@@ -127,7 +127,11 @@ async def _get_curl(url: str, params: dict | None = None) -> dict | list | None:
 
 async def _get_aiohttp(url: str, params: dict | None = None) -> dict | list | None:
     """Fallback: aiohttp without Cloudflare bypass."""
-    import aiohttp
+    try:
+        import aiohttp
+    except ImportError:
+        logger.error("aiohttp not installed and curl_cffi unavailable — cannot make requests")
+        return None
     import ssl
     try:
         import certifi

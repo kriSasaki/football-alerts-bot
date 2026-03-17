@@ -22,12 +22,21 @@ if exist .env copy /Y .env "%BACKUP_DIR%\.env" >nul
 echo    Бэкап сохранён: %BACKUP_DIR%
 
 echo [3/4] Загружаю обновления из GitHub...
-git stash 2>nul
+REM Сбрасываем любые локальные конфликты/изменения в коде
+REM Данные (.env, alerts.db, approved_users.json) защищены .gitignore
+git reset --hard HEAD 2>nul
+git clean -fd --exclude=.env --exclude=alerts.db --exclude=alerts.db-journal --exclude=approved_users.json --exclude=backups 2>nul
 git pull origin main
-git stash pop 2>nul
+if errorlevel 1 (
+    echo.
+    echo [!] Git pull не удался. Пробую полный сброс...
+    git fetch origin main
+    git reset --hard origin/main
+)
 
 echo [4/4] Обновляю зависимости...
-pip install -r requirements.txt --break-system-packages -q
+pip install -r requirements.txt --break-system-packages -q 2>nul
+pip install -r requirements.txt -q 2>nul
 
 echo.
 echo ═══════════════════════════════════════════
