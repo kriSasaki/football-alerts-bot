@@ -143,7 +143,11 @@ async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list
                     headers={"Content-Type": "application/json"},
                     timeout=35,
                 )
-                data = resp.json()
+                resp_text = resp.text
+                if not resp_text:
+                    logger.error("FlareSolverr empty response body")
+                    return None
+                data = json.loads(resp_text)
         else:
             # Fallback: synchronous urllib (runs in thread)
             import urllib.request
@@ -169,7 +173,9 @@ async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list
         return json.loads(body)
 
     except json.JSONDecodeError as e:
-        logger.error("FlareSolverr JSON parse error: %s (url: %s)", e, full_url)
+        # Log first 200 chars of response for debugging
+        snippet = resp_text[:200] if 'resp_text' in dir() else 'N/A'
+        logger.error("FlareSolverr JSON parse error: %s (url: %s, response: %s)", e, full_url, snippet)
         return None
     except Exception as e:
         logger.error("FlareSolverr request error: %s (url: %s)", e, full_url)
