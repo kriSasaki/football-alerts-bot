@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1220">
+  <title>Pulse Alerts</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <main class="app">
+    <section id="loginView" class="login-view hidden">
+      <div class="login-card">
+        <p class="eyebrow">Закрытый доступ</p>
+        <h1>Вход по персональной ссылке</h1>
+        <p id="loginMessage" class="muted">Открой ссылку, полученную в Telegram после подтверждения доступа администратором.</p>
+      </div>
+    </section>
+
+    <section id="dashboard" class="hidden">
+      <header class="topbar">
+        <div>
+        <p class="eyebrow" id="appNameEyebrow">Pulse Alerts</p>
+          <h1>Панель уведомлений</h1>
+          <p id="statusLine" class="muted">Подключение...</p>
+        </div>
+        <div class="topbar-actions">
+          <button id="logoutButton" class="ghost">Выйти</button>
+          <button id="revokeSessionsButton" class="ghost">Выйти на всех моих устройствах</button>
+          <button id="themeToggle" class="ghost">Тёмная тема</button>
+          <button id="testPush" class="ghost">Тест push</button>
+          <button id="enablePush" class="primary">Включить push</button>
+        </div>
+      </header>
+
+      <section class="layout">
+        <aside class="panel builder">
+          <div class="panel-head">
+            <h2>Новый алерт</h2>
+            <span id="subscriptionBadge" class="badge">push off</span>
+          </div>
+
+          <div class="form-grid">
+            <label>Спорт
+              <select id="sportSelect"></select>
+            </label>
+            <label>День
+              <select id="dayOffsetSelect">
+                <option value="0">Сегодня</option>
+                <option value="1">Завтра</option>
+                <option value="2">Через 2 дня</option>
+                <option value="-1">Вчера</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="form-grid">
+            <label>Показатель
+              <select id="statSelect"></select>
+            </label>
+            <label id="operatorWrap">Условие
+              <select id="operatorSelect"></select>
+            </label>
+          </div>
+
+          <div class="form-grid">
+            <label id="thresholdWrap">Значение
+              <input id="thresholdInput" type="number" value="8" step="0.5">
+            </label>
+            <label id="teamWrap">Сторона
+              <select id="teamSelect">
+                <option value="total">Общий тотал</option>
+                <option value="home">Хозяева</option>
+                <option value="away">Гости</option>
+              </select>
+            </label>
+          </div>
+
+          <p id="conditionHint" class="hint"></p>
+
+          <div class="action-stack">
+            <button id="createCurrentAlert" class="primary wide">Поставить на выбранный матч</button>
+            <button id="createSelectedAlerts" class="secondary wide">Поставить на отмеченные матчи</button>
+            <button id="createAllVisibleAlerts" class="ghost wide">Поставить на все матчи за день</button>
+          </div>
+        </aside>
+
+        <section class="content">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Матчи</h2>
+              <div class="inline-actions">
+                <select id="matchFilterSelect">
+                  <option value="all">Все</option>
+                  <option value="live">Только live</option>
+                  <option value="upcoming">Только будущие</option>
+                  <option value="hide_finished">Скрыть завершённые</option>
+                </select>
+                <button id="selectAllMatches" class="ghost">Отметить все</button>
+                <button id="clearMatchSelection" class="ghost">Снять выбор</button>
+              </div>
+            </div>
+            <div id="matchesMeta" class="muted"></div>
+            <div id="matchesList" class="match-list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Детали матча</h2>
+              <span id="selectedCount" class="badge">0 выбрано</span>
+            </div>
+            <div id="matchDetail" class="detail empty">Выбери матч из списка слева.</div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Активные алерты</h2>
+              <button id="refreshAlerts" class="ghost">Обновить</button>
+            </div>
+            <div id="alertsList" class="alerts empty">Алертов пока нет.</div>
+          </article>
+
+          <article id="adminPanel" class="panel hidden">
+            <div class="panel-head">
+              <h2>Доступ</h2>
+              <button id="refreshAdminState" class="ghost">Обновить</button>
+            </div>
+            <div id="adminState" class="detail empty">Нет данных.</div>
+          </article>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

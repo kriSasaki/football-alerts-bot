@@ -15,12 +15,14 @@ import time
 import os
 import sys
 import httpx
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
 )
+from telegram.error import TimedOut
 from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -32,10 +34,16 @@ from config import (
     TELEGRAM_BOT_TOKEN, POLL_INTERVAL_SECONDS,
     FOOTBALL_STATS, BASKETBALL_STATS,
     SUPPORTED_OPERATORS, SPORTS, MATCH_START_TOLERANCE,
+    KICKOFF_LOOKAROUND_SECONDS,
+    TELEGRAM_ENABLED, ALLOW_WEB_ONLY_FALLBACK,
+    TELEGRAM_PROXY, TELEGRAM_BASE_URL, APP_NAME,
 )
 from auth import is_authorized, pending_requests, approve_user, reject_user, get_admin_ids, add_pending_request
 import database as db
 import sports_api as api
+from webapp import start_web_app, stop_web_app, get_runtime_web_url
+from webpush import send_user_push
+from web_auth import issue_web_token
 from alert_engine import (
     check_football_alert, check_basketball_alert,
     format_football_notification, format_basketball_notification,
@@ -88,6 +96,8 @@ logging.getLogger("telegram.ext").setLevel(logging.INFO)
 logging.getLogger("apscheduler").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
+_poll_lock = asyncio.Lock()
+_web_runner = None
 
 # ═══════════════════════════════════════════════════════
 #  SAFE TELEGRAM EDIT (suppress common errors)
@@ -170,13 +180,14 @@ async def _show_main_menu(target, edit=False, user_id=None):
     if user_id:
         alert_count = await db.count_user_active_alerts(user_id)
 
-    text = "🏟 <b>Sports Alerts Bot v2</b>\n<i>SofaScore • Бесплатно • Без API ключа</i>\n\nВыбери спорт:"
+    text = f"🏟 <b>{APP_NAME}</b>\n<i>Персональные уведомления по матчам</i>\n\nВыбери спорт:"
     buttons = [
         [InlineKeyboardButton(f"{v['emoji']} {v['label']}", callback_data=f"sport:{k}")]
         for k, v in SPORTS.items()
     ]
     alert_label = f"📋 Мои алерты ({alert_count})" if alert_count else "📋 Мои алерты"
     buttons.append([InlineKeyboardButton(alert_label, callback_data="myalerts:0")])
+    buttons.append([InlineKeyboardButton("🌐 Веб-панель", callback_data="web_link")])
     if alert_count > 0:
         buttons.append([
             InlineKeyboardButton(f"❌ Отменить ВСЕ алерты ({alert_count})", callback_data="cancel_all_confirm"),
@@ -798,17 +809,57 @@ async def _show_help(query):
         "<b>📊 Статус алерта:</b>\n"
         "В 'Мои алерты' → кнопка 📊 покажет\n"
         "текущее значение статистики live.\n\n"
+        "<b>🌐 Веб-панель:</b>\n"
+        "Команда /web откроет персональную ссылку\n"
+        "для закрытого входа в web-версию.\n\n"
         "<b>🕐 Алерты на будущие матчи:</b>\n"
-        "Бот спит до начала — 0 запросов.\n"
-        "Если матч задерживается >1ч — предупредит.\n\n"
-        "<b>🔄 Источник данных:</b> SofaScore (бесплатно)\n"
-        "Опрос: каждые 2 мин (live-матчи)\n"
-        "Кэш: запросы не дублируются\n\n"
+        "Мониторинг включается автоматически к старту матча.\n\n"
         "Вручную: <code>/setalert football 12345 corners > 8</code>"
     )
     await query.edit_message_text(text, parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🏠 Главная", callback_data="main_menu")]]))
+
+
+async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("🔐 Сначала получи доступ через /start", parse_mode=ParseMode.HTML)
+        return
+
+    public_url = get_runtime_web_url()
+    if not public_url:
+        await update.message.reply_text("❌ Веб-панель ещё не настроена.", parse_mode=ParseMode.HTML)
+        return
+
+    token = issue_web_token(user_id)
+    url = f"{public_url.rstrip('/')}/?token={token}"
+    await update.message.reply_text(
+        f"🌐 <b>Твоя персональная ссылка</b>\n\n{url}\n\nНикому её не передавай.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 <b>Команды</b>\n\n/start — главное меню\n/web — персональная ссылка в веб-панель\n/setalert — создать алерт вручную",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _send_web_link(target, user_id: int):
+    public_url = get_runtime_web_url()
+    if not public_url:
+        await target.reply_text("❌ Веб-панель ещё не настроена.", parse_mode=ParseMode.HTML)
+        return
+    token = issue_web_token(user_id)
+    url = f"{public_url.rstrip('/')}/?token={token}"
+    await target.reply_text(
+        f"🌐 <b>Персональная ссылка</b>\n\n{url}\n\nНикому её не передавай.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 # ═══════════════════════════════════════════════════════
@@ -957,6 +1008,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _show_my_alerts(query)
         elif data == "help":
             await _show_help(query)
+        elif data == "web_link":
+            await _send_web_link(query.message, query.from_user.id)
         elif data.startswith("auth_approve:"):
             target_id = int(data.split(":")[1])
             if query.from_user.id in get_admin_ids():
@@ -966,7 +1019,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=target_id,
-                        text="✅ <b>Доступ одобрен!</b>\nНажми /start чтобы начать.",
+                        text="✅ <b>Доступ одобрен!</b>\nНажми /start для меню или /web для персональной веб-ссылки.",
                         parse_mode=ParseMode.HTML)
                 except: pass
         elif data.startswith("auth_reject:"):
@@ -1091,8 +1144,34 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  POLLING ENGINE (optimized)
 # ═══════════════════════════════════════════════════════
 
-FINISHED_TYPES = {"finished"}
-BB_FINISHED_TYPES = {"finished"}
+async def _send_html_message(bot, chat_id: int, text: str):
+    if chat_id < 0:
+        sent, removed = await send_user_push(chat_id, text)
+        if sent == 0:
+            logger.warning("No active web-push subscriptions for synthetic chat %s", chat_id)
+        elif removed:
+            logger.info("Removed %d stale web-push subscriptions for %s", removed, chat_id)
+        return
+
+    if bot is None:
+        logger.warning("Telegram unavailable, skipping message to chat %s", chat_id)
+        return
+
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error("Send failed to %s: %s", chat_id, e)
+
+
+def _fixture_needs_probe(alerts: list[dict], now_ts: float) -> bool:
+    """Only probe fixtures that are live/unknown or close enough to kickoff."""
+    kickoffs = [float(a.get("kickoff_at") or 0) for a in alerts]
+    if not kickoffs or any(k <= 0 for k in kickoffs):
+        return True
+    earliest = min(kickoffs)
+    latest = max(kickoffs)
+    post_kickoff_probe_window = max(KICKOFF_LOOKAROUND_SECONDS, 3 * 3600)
+    return (earliest - KICKOFF_LOOKAROUND_SECONDS) <= now_ts <= (latest + post_kickoff_probe_window)
 
 
 async def poll_and_check(context: ContextTypes.DEFAULT_TYPE):
@@ -1100,56 +1179,69 @@ async def poll_and_check(context: ContextTypes.DEFAULT_TYPE):
     - 1 request for ALL live football events (shared by all football alerts)
     - 1 request for ALL live basketball events (shared by all basketball alerts)
     - Statistics fetched only if needed, with cache
+    - All active alerts are loaded from DB in one query per cycle
+    - Non-live fixtures are probed individually only near kickoff
     """
-    try:
-        watched = await db.get_watched_by_sport()
-        if not watched:
-            return
+    if _poll_lock.locked():
+        logger.warning("Previous polling cycle is still running, skipping overlap")
+        return
 
-        fb_ids = watched.get("football", set())
-        if fb_ids:
-            await _poll_football(context, fb_ids)
+    async with _poll_lock:
+        started_at = time.monotonic()
+        try:
+            snapshot = await db.get_active_alerts_snapshot()
+            if not snapshot:
+                return
 
-        bb_ids = watched.get("basketball", set())
-        if bb_ids:
-            await _poll_basketball(context, bb_ids)
+            tasks = []
+            football_alerts = snapshot.get("football", {})
+            if football_alerts:
+                tasks.append(_poll_football(context, football_alerts))
 
-        # Cleanup cache periodically
-        api.cleanup_cache()
+            basketball_alerts = snapshot.get("basketball", {})
+            if basketball_alerts:
+                tasks.append(_poll_basketball(context, basketball_alerts))
 
-    except Exception as e:
-        logger.error("Polling error: %s", e, exc_info=True)
+            if tasks:
+                await asyncio.gather(*tasks)
+
+            api.cleanup_cache()
+            logger.info(
+                "Polling cycle finished in %.2fs (football fixtures=%d, basketball fixtures=%d)",
+                time.monotonic() - started_at,
+                len(football_alerts),
+                len(basketball_alerts),
+            )
+        except Exception as e:
+            logger.error("Polling error: %s", e, exc_info=True)
 
 
-async def _poll_football(context, watched_ids):
-    logger.info("Polling %d football events via SofaScore...", len(watched_ids))
+async def _poll_football(context, alerts_by_fixture: dict[int, list[dict]]):
+    logger.info("Polling %d football fixtures via SofaScore...", len(alerts_by_fixture))
+    now_ts = time.time()
 
     # 1 request — get all live football events
     all_live = await api.football_live()
     live_index = {api.get_event_id(ev): ev for ev in all_live}
 
-    for fid in watched_ids:
+    for fid, alerts in alerts_by_fixture.items():
         ev = live_index.get(fid)
 
-        if not ev:
-            # Not in live list — check individually (uses cache)
+        if ev is None and _fixture_needs_probe(alerts, now_ts):
+            # Not in live list but close enough to kickoff to justify an individual probe.
             ev = await api.football_event(fid)
             if not ev:
-                await db.deactivate_fixture_alerts(fid, "football")
                 continue
             if api.is_finished(ev) or api.is_canceled_or_postponed(ev):
                 await db.deactivate_fixture_alerts(fid, "football")
                 continue
-            # Still not started — skip
             if api.is_not_started(ev):
                 continue
+        elif ev is None:
+            continue
 
         if api.is_finished(ev) or api.is_canceled_or_postponed(ev):
             await db.deactivate_fixture_alerts(fid, "football")
-            continue
-
-        alerts = await db.get_active_alerts(fid, "football")
-        if not alerts:
             continue
 
         # Check if we need detailed stats
@@ -1162,40 +1254,35 @@ async def _poll_football(context, watched_ids):
             triggered, value = check_football_alert(alert, stats, ev)
             if triggered:
                 msg = format_football_notification(alert, value, ev)
-                try:
-                    await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    logger.error("Send failed: %s", e)
+                await _send_html_message(context.bot, alert["chat_id"], msg)
                 await db.mark_triggered(alert["id"], value, msg)
 
 
-async def _poll_basketball(context, watched_ids):
-    logger.info("Polling %d basketball events via SofaScore...", len(watched_ids))
+async def _poll_basketball(context, alerts_by_fixture: dict[int, list[dict]]):
+    logger.info("Polling %d basketball fixtures via SofaScore...", len(alerts_by_fixture))
+    now_ts = time.time()
 
     # 1 request — get all live basketball events
     all_live = await api.basketball_live()
     live_index = {api.get_event_id(ev): ev for ev in all_live}
 
-    for gid in watched_ids:
+    for gid, alerts in alerts_by_fixture.items():
         ev = live_index.get(gid)
 
-        if not ev:
+        if ev is None and _fixture_needs_probe(alerts, now_ts):
             ev = await api.basketball_event(gid)
             if not ev:
-                await db.deactivate_fixture_alerts(gid, "basketball")
                 continue
             if api.is_finished(ev) or api.is_canceled_or_postponed(ev):
                 await db.deactivate_fixture_alerts(gid, "basketball")
                 continue
             if api.is_not_started(ev):
                 continue
+        elif ev is None:
+            continue
 
         if api.is_finished(ev) or api.is_canceled_or_postponed(ev):
             await db.deactivate_fixture_alerts(gid, "basketball")
-            continue
-
-        alerts = await db.get_active_alerts(gid, "basketball")
-        if not alerts:
             continue
 
         parsed = api.parse_basketball_scores(ev)
@@ -1204,10 +1291,7 @@ async def _poll_basketball(context, watched_ids):
             triggered, value, extra = check_basketball_alert(alert, parsed)
             if triggered:
                 msg = format_basketball_notification(alert, value, ev, extra)
-                try:
-                    await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    logger.error("Send failed: %s", e)
+                await _send_html_message(context.bot, alert["chat_id"], msg)
                 await db.mark_triggered(alert["id"], value or 0, msg)
 
 
@@ -1303,13 +1387,7 @@ async def check_overdue_matches(context: ContextTypes.DEFAULT_TYPE):
                 lines.append("Алерты пока активны, жду начала.")
 
             if lines:
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text="\n".join(lines),
-                        parse_mode=ParseMode.HTML)
-                except Exception as e:
-                    logger.error("Failed to send overdue summary to %s: %s", chat_id, e)
+                await _send_html_message(context.bot, chat_id, "\n".join(lines))
 
     except Exception as e:
         logger.error("Overdue check error: %s", e, exc_info=True)
@@ -1319,22 +1397,61 @@ async def check_overdue_matches(context: ContextTypes.DEFAULT_TYPE):
 #  STARTUP
 # ═══════════════════════════════════════════════════════
 
-async def post_init(app: Application):
+async def _startup_core(bot=None):
+    global _web_runner
     await db.init_db()
     logger.info("Database initialized")
     # Auto-cleanup stale alerts on startup (>24h old) — no spam
     cleaned = await db.auto_cleanup_stale_alerts(max_age_hours=24)
     if cleaned:
         logger.info("Startup cleanup: deactivated %d stale alerts", cleaned)
-    await app.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("setalert", "Создать алерт вручную"),
-        BotCommand("help", "Помощь"),
-    ])
+    if bot is not None:
+        await bot.set_my_commands([
+            BotCommand("start", "Главное меню"),
+            BotCommand("setalert", "Создать алерт вручную"),
+            BotCommand("help", "Помощь"),
+            BotCommand("web", "Открыть веб-панель"),
+        ])
+    _web_runner, _ = await start_web_app()
+
+
+async def post_init(app: Application):
+    await _startup_core(app.bot)
+
+
+async def _shutdown_core():
+    global _web_runner
+    await api.close_session()
+    await stop_web_app(_web_runner)
+    _web_runner = None
+
+
+async def post_shutdown(app: Application):
+    await _shutdown_core()
+
+
+async def run_web_only():
+    logger.warning("Starting in web-push-only mode (Telegram disabled or unreachable)")
+    await _startup_core(bot=None)
+    context = SimpleNamespace(bot=None)
+    try:
+        while True:
+            await poll_and_check(context)
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    finally:
+        await _shutdown_core()
 
 
 def main():
+    if not TELEGRAM_ENABLED:
+        asyncio.run(run_web_only())
+        return
+
     if not TELEGRAM_BOT_TOKEN:
+        if ALLOW_WEB_ONLY_FALLBACK:
+            logger.warning("TELEGRAM_BOT_TOKEN missing, falling back to web-push-only mode")
+            asyncio.run(run_web_only())
+            return
         print("❌ Set TELEGRAM_BOT_TOKEN in .env!")
         return
 
@@ -1354,18 +1471,20 @@ def main():
             retries=1,
         )
     }
+    if TELEGRAM_PROXY:
+        telegram_httpx_kwargs["proxy"] = TELEGRAM_PROXY
     telegram_request = HTTPXRequest(
-        connect_timeout=60,
-        read_timeout=60,
-        write_timeout=60,
-        pool_timeout=60,
+        connect_timeout=15,
+        read_timeout=20,
+        write_timeout=20,
+        pool_timeout=20,
         httpx_kwargs=telegram_httpx_kwargs,
     )
     telegram_updates_request = HTTPXRequest(
-        connect_timeout=60,
+        connect_timeout=15,
         read_timeout=60,
-        write_timeout=60,
-        pool_timeout=60,
+        write_timeout=20,
+        pool_timeout=20,
         httpx_kwargs=telegram_httpx_kwargs,
     )
 
@@ -1373,14 +1492,28 @@ def main():
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .request(telegram_request)
         .get_updates_request(telegram_updates_request)
         .build()
     )
+    if TELEGRAM_BASE_URL:
+        app = (
+            Application.builder()
+            .token(TELEGRAM_BOT_TOKEN)
+            .base_url(TELEGRAM_BASE_URL.rstrip("/") + "/bot")
+            .base_file_url(TELEGRAM_BASE_URL.rstrip("/") + "/file/bot")
+            .post_init(post_init)
+            .post_shutdown(post_shutdown)
+            .request(telegram_request)
+            .get_updates_request(telegram_updates_request)
+            .build()
+        )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setalert", cmd_setalert))
-    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("web", cmd_web))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -1388,7 +1521,7 @@ def main():
     app.job_queue.run_repeating(
         poll_and_check,
         interval=POLL_INTERVAL_SECONDS,
-        first=10,
+        first=5,
         name="poll_live_stats")
 
     # Check for overdue matches every 10 minutes
@@ -1399,12 +1532,18 @@ def main():
         name="check_overdue")
 
     logger.info("Polling every %d sec via SofaScore", POLL_INTERVAL_SECONDS)
-    logger.info("Starting Sports Alerts Bot v2 (SofaScore)...")
+    logger.info("Starting %s...", APP_NAME)
     # bootstrap_retries=-1 = retry forever until connected
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        bootstrap_retries=-1,
-    )
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            bootstrap_retries=-1,
+        )
+    except TimedOut:
+        if not ALLOW_WEB_ONLY_FALLBACK:
+            raise
+        logger.warning("Telegram bootstrap timed out, switching to web-push-only mode")
+        asyncio.run(run_web_only())
 
 
 if __name__ == "__main__":

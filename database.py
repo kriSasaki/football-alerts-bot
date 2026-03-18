@@ -42,8 +42,20 @@ async def init_db():
                 created_at  REAL    NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                endpoint    TEXT    NOT NULL UNIQUE,
+                subscription_json TEXT NOT NULL,
+                user_agent  TEXT    DEFAULT '',
+                created_at  REAL    NOT NULL,
+                updated_at  REAL    NOT NULL
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active, fixture_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON alerts(user_id, active)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_web_push_user ON web_push_subscriptions(user_id)")
         # Migrations for older DBs
         for sql in [
             "ALTER TABLE alerts ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
@@ -51,6 +63,7 @@ async def init_db():
             "ALTER TABLE alerts ADD COLUMN match_label TEXT DEFAULT ''",
             "ALTER TABLE alerts ADD COLUMN overdue_notified INTEGER DEFAULT 0",
             "ALTER TABLE alert_history ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
+            "ALTER TABLE web_push_subscriptions ADD COLUMN user_agent TEXT DEFAULT ''",
         ]:
             try:
                 await db.execute(sql)
@@ -111,6 +124,23 @@ async def get_active_alerts(fixture_id: int | None = None, sport: str | None = N
         if sport:
             q += " AND sport = ?"; p.append(sport)
         return [dict(r) for r in await db.execute_fetchall(q, p)]
+
+
+async def get_active_alerts_snapshot() -> dict[str, dict[int, list[dict]]]:
+    """Return all active alerts grouped as sport -> fixture_id -> alerts."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM alerts WHERE active = 1 ORDER BY sport, fixture_id, id"
+        )
+
+    snapshot: dict[str, dict[int, list[dict]]] = {}
+    for row in rows:
+        alert = dict(row)
+        sport = alert.get("sport", "football")
+        fixture_id = alert["fixture_id"]
+        snapshot.setdefault(sport, {}).setdefault(fixture_id, []).append(alert)
+    return snapshot
 
 
 async def get_user_alerts(user_id: int) -> list[dict]:
@@ -246,3 +276,37 @@ async def count_user_active_alerts(user_id: int) -> int:
         rows = await db.execute_fetchall(
             "SELECT COUNT(*) FROM alerts WHERE user_id = ? AND active = 1", (user_id,))
         return rows[0][0] if rows else 0
+
+
+async def save_web_push_subscription(user_id: int, endpoint: str, subscription_json: str, user_agent: str = ""):
+    now = time.time()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO web_push_subscriptions (user_id, endpoint, subscription_json, user_agent, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET
+                user_id=excluded.user_id,
+                subscription_json=excluded.subscription_json,
+                user_agent=excluded.user_agent,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, endpoint, subscription_json, user_agent, now, now),
+        )
+        await db.commit()
+
+
+async def delete_web_push_subscription(endpoint: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM web_push_subscriptions WHERE endpoint = ?", (endpoint,))
+        await db.commit()
+
+
+async def get_web_push_subscriptions(user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            "SELECT * FROM web_push_subscriptions WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,),
+        )
+        return [dict(r) for r in rows]

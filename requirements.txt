@@ -3,6 +3,6 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 certifi
 curl_cffi>=0.5.10
-# aiohttp — optional fallback, only needed if curl_cffi unavailable
-# On Python 3.14 Windows requires Visual C++ Build Tools to compile
-# Install manually if needed: pip install aiohttp --break-system-packages
+aiohttp>=3.10,<4
+pywebpush>=2.0.3
+py-vapid>=1.9.2

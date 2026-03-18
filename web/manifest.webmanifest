@@ -1,0 +1,10 @@
+{
+  "name": "Pulse Alerts",
+  "short_name": "Pulse Alerts",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#eef2f6",
+  "theme_color": "#0f172a",
+  "lang": "ru",
+  "description": "Закрытая панель персональных уведомлений по матчам"
+}

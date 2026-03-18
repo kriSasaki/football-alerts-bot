@@ -10,6 +10,7 @@ Telegram-бот для мониторинга live-статистики **фут
 - 🎲 **Массовые алерты** — ставь алерт на ВСЕ матчи дня одной кнопкой
 - 😴 **Умный polling** — будущие матчи не тратят запросы до начала
 - 📊 **Live-статус** — смотри текущее значение статистики прямо в боте
+- 🌐 **Web Push PWA** — отдельная веб-панель с push-уведомлениями без Telegram
 - 🔐 **Авторизация** — управление доступом: whitelist или одобрение админом
 - 🚀 **Источник данных** — SofaScore (бесплатно, без лимитов)
 
@@ -62,6 +63,37 @@ AUTHORIZED_USERS=123456789,987654321
 ```bash
 python bot.py
 ```
+
+### Web Push Setup
+
+1. Установи новые зависимости:
+
+```bash
+pip install -r requirements.txt
+```
+
+2. Сгенерируй VAPID-ключи:
+
+```bash
+python generate_vapid_keys.py
+```
+
+3. Добавь ключи в `.env`:
+
+```env
+TELEGRAM_ENABLED=1
+ALLOW_WEB_ONLY_FALLBACK=1
+WEB_APP_ENABLED=1
+WEB_APP_PORT=8080
+WEB_APP_PUBLIC_URL=https://your-domain.example
+WEB_PUSH_VAPID_PUBLIC_KEY=...
+WEB_PUSH_VAPID_PRIVATE_KEY=...
+WEB_PUSH_VAPID_SUBJECT=mailto:you@example.com
+```
+
+4. После запуска открой `WEB_APP_PUBLIC_URL`, включи push и создавай алерты в веб-панели.
+5. Если Telegram из вашей сети не поднимается, можно либо оставить `ALLOW_WEB_ONLY_FALLBACK=1`, либо явно выставить `TELEGRAM_ENABLED=0` для чистого web-push режима.
+6. Для закрытого входа в веб-панель используй команду `/web` у уже одобренного Telegram-пользователя.
 
 ## Авторизация пользователей
 
@@ -131,14 +163,31 @@ bot.py             — Telegram-хендлеры, точка входа
 | Переменная | По умолчанию | Описание |
 |-----------|-------------|----------|
 | `TELEGRAM_BOT_TOKEN` | — | **Обязательно.** Токен от BotFather |
-| `POLL_INTERVAL` | `120` | Интервал опроса live-матчей (секунды) |
-| `SOFASCORE_MIN_INTERVAL` | `1.5` | Мин. пауза между запросами к SofaScore |
-| `LIVE_CACHE_TTL` | `60` | Время жизни кэша live-матчей |
+| `TELEGRAM_ENABLED` | `1` | Включить Telegram-часть процесса |
+| `ALLOW_WEB_ONLY_FALLBACK` | `1` | При таймауте Telegram автоматически перейти в web-push-only режим |
+| `TELEGRAM_PROXY` | — | HTTP/SOCKS прокси для Telegram Bot API |
+| `TELEGRAM_BASE_URL` | — | Альтернативный Bot API endpoint или self-hosted telegram-bot-api |
+| `APP_NAME` | `Pulse Alerts` | Пользовательское имя продукта в интерфейсе |
+| `POLL_INTERVAL` | `15` | Интервал опроса live-матчей (секунды) |
+| `SOFASCORE_MIN_INTERVAL` | `0.75` | Мин. пауза между запросами к SofaScore |
+| `LIVE_CACHE_TTL` | `10` | Время жизни кэша live-матчей |
+| `EVENT_CACHE_TTL` | `20` | Время жизни кэша точечного запроса по матчу |
+| `STATS_CACHE_TTL` | `10` | Время жизни кэша live-статистики |
 | `SCHEDULE_CACHE_TTL` | `300` | Время жизни кэша расписания |
+| `KICKOFF_LOOKAROUND_SECONDS` | `900` | Окно до/после стартового времени для точечной проверки матча |
 | `MATCH_START_TOLERANCE` | `3600` | Предупреждение о задержке матча (сек) |
 | `DATABASE_PATH` | `alerts.db` | Путь к SQLite базе |
 | `ADMIN_USERS` | — | ID админов (через запятую) |
 | `AUTHORIZED_USERS` | — | ID с моментальным доступом |
+| `WEB_APP_ENABLED` | `1` | Включить встроенную PWA/web push панель |
+| `WEB_APP_PORT` | `8080` | Порт встроенного web-сервера |
+| `WEB_APP_PORT_MAX_TRIES` | `10` | Сколько соседних портов проверить, если основной занят |
+| `WEB_APP_PUBLIC_URL` | — | Публичный URL панели для открытия уведомлений |
+| `WEB_AUTH_TTL_SECONDS` | `2592000` | Срок жизни персональной web-ссылки |
+| `WEB_AUTH_SECRET` | — | Отдельный секрет для подписи web-сессий |
+| `WEB_PUSH_VAPID_PUBLIC_KEY` | — | Публичный VAPID-ключ для browser push |
+| `WEB_PUSH_VAPID_PRIVATE_KEY` | — | Приватный VAPID-ключ для отправки push |
+| `WEB_PUSH_VAPID_SUBJECT` | `mailto:admin@example.com` | Контакт для VAPID claims |
 
 ## Деплой
 

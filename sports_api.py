@@ -14,7 +14,14 @@ import time
 import json
 from datetime import datetime, timezone
 
-from config import SOFASCORE_BASE, SOFASCORE_MIN_INTERVAL
+from config import (
+    SOFASCORE_BASE,
+    SOFASCORE_MIN_INTERVAL,
+    LIVE_CACHE_TTL,
+    EVENT_CACHE_TTL,
+    STATS_CACHE_TTL,
+    SCHEDULE_CACHE_TTL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,7 +376,6 @@ def cleanup_cache():
 
 async def football_live() -> list[dict]:
     """All currently live football events. Uses cache."""
-    from config import LIVE_CACHE_TTL
     cached = cache.get("football_live", LIVE_CACHE_TTL)
     if cached is not None:
         return cached
@@ -384,7 +390,6 @@ async def football_live() -> list[dict]:
 
 async def football_by_date(date_str: str) -> list[dict]:
     """All football events for a date (YYYY-MM-DD). Uses cache."""
-    from config import SCHEDULE_CACHE_TTL
     cache_key = f"football_date_{date_str}"
     cached = cache.get(cache_key, SCHEDULE_CACHE_TTL)
     if cached is not None:
@@ -401,7 +406,7 @@ async def football_by_date(date_str: str) -> list[dict]:
 async def football_event(event_id: int) -> dict | None:
     """Single event details."""
     cache_key = f"football_event_{event_id}"
-    cached = cache.get(cache_key, 60)
+    cached = cache.get(cache_key, EVENT_CACHE_TTL)
     if cached is not None:
         return cached
 
@@ -416,7 +421,7 @@ async def football_event(event_id: int) -> dict | None:
 async def football_statistics(event_id: int) -> dict:
     """Match statistics. Returns {'home': {...}, 'away': {...}}."""
     cache_key = f"football_stats_{event_id}"
-    cached = cache.get(cache_key, 45)
+    cached = cache.get(cache_key, STATS_CACHE_TTL)
     if cached is not None:
         return cached
 
@@ -555,7 +560,6 @@ def get_tournament_name(event: dict) -> str:
 
 async def basketball_live() -> list[dict]:
     """All currently live basketball events."""
-    from config import LIVE_CACHE_TTL
     cached = cache.get("basketball_live", LIVE_CACHE_TTL)
     if cached is not None:
         return cached
@@ -570,7 +574,6 @@ async def basketball_live() -> list[dict]:
 
 async def basketball_by_date(date_str: str) -> list[dict]:
     """All basketball events for a date."""
-    from config import SCHEDULE_CACHE_TTL
     cache_key = f"basketball_date_{date_str}"
     cached = cache.get(cache_key, SCHEDULE_CACHE_TTL)
     if cached is not None:
@@ -587,7 +590,7 @@ async def basketball_by_date(date_str: str) -> list[dict]:
 async def basketball_event(event_id: int) -> dict | None:
     """Single basketball event."""
     cache_key = f"basketball_event_{event_id}"
-    cached = cache.get(cache_key, 60)
+    cached = cache.get(cache_key, EVENT_CACHE_TTL)
     if cached is not None:
         return cached
 
