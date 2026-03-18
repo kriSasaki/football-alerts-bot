@@ -133,6 +133,7 @@ async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list
         "maxTimeout": 30000,
     })
 
+    resp_text = ""
     try:
         if _USE_CURL_CFFI:
             from curl_cffi.requests import AsyncSession
@@ -143,13 +144,8 @@ async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list
                     headers={"Content-Type": "application/json"},
                     timeout=35,
                 )
-                resp_text = resp.text
-                if not resp_text:
-                    logger.error("FlareSolverr empty response body")
-                    return None
-                data = json.loads(resp_text)
+                resp_bytes = resp.content
         else:
-            # Fallback: synchronous urllib (runs in thread)
             import urllib.request
             req = urllib.request.Request(
                 _FLARESOLVERR_URL,
@@ -157,25 +153,34 @@ async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list
                 headers={"Content-Type": "application/json"},
             )
             loop = asyncio.get_event_loop()
-            resp_data = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=35).read())
-            data = json.loads(resp_data)
+            resp_bytes = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=35).read())
 
-        if data.get("status") != "ok":
-            logger.warning("FlareSolverr error: %s", data.get("message", "unknown"))
+        # Parse FlareSolverr wrapper JSON
+        wrapper = json.loads(resp_bytes)
+
+        if wrapper.get("status") != "ok":
+            logger.warning("FlareSolverr error: %s", wrapper.get("message", "unknown"))
             return None
 
-        # FlareSolverr returns the page body as a string in solution.response
-        body = data.get("solution", {}).get("response", "")
+        solution = wrapper.get("solution", {})
+        http_status = solution.get("status", 0)
+        if http_status != 200:
+            logger.warning("FlareSolverr got HTTP %s for %s", http_status, full_url)
+            return None
+
+        # solution.response is the actual page body (JSON string from SofaScore)
+        body = solution.get("response", "")
         if not body:
-            logger.warning("FlareSolverr empty response for %s", full_url)
+            logger.warning("FlareSolverr empty response body for %s", full_url)
             return None
 
-        return json.loads(body)
+        # SofaScore returns JSON — parse it
+        result = json.loads(body)
+        logger.debug("FlareSolverr OK: %s", full_url)
+        return result
 
     except json.JSONDecodeError as e:
-        # Log first 200 chars of response for debugging
-        snippet = resp_text[:200] if 'resp_text' in dir() else 'N/A'
-        logger.error("FlareSolverr JSON parse error: %s (url: %s, response: %s)", e, full_url, snippet)
+        logger.error("FlareSolverr JSON parse error: %s (url: %s)", e, full_url)
         return None
     except Exception as e:
         logger.error("FlareSolverr request error: %s (url: %s)", e, full_url)
