@@ -14,12 +14,14 @@ import asyncio
 import time
 import os
 import sys
+import httpx
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
 )
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters,
@@ -1343,10 +1345,36 @@ def main():
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
+    # Some Windows/ISP setups intermittently route Telegram HTTPS via IPv6 or
+    # inherited proxy settings. Use a direct IPv4 httpx transport for stability.
+    telegram_httpx_kwargs = {
+        "transport": httpx.AsyncHTTPTransport(
+            local_address="0.0.0.0",
+            trust_env=False,
+            retries=1,
+        )
+    }
+    telegram_request = HTTPXRequest(
+        connect_timeout=60,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=60,
+        httpx_kwargs=telegram_httpx_kwargs,
+    )
+    telegram_updates_request = HTTPXRequest(
+        connect_timeout=60,
+        read_timeout=60,
+        write_timeout=60,
+        pool_timeout=60,
+        httpx_kwargs=telegram_httpx_kwargs,
+    )
+
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .request(telegram_request)
+        .get_updates_request(telegram_updates_request)
         .connect_timeout(60)
         .read_timeout(60)
         .write_timeout(60)
@@ -1384,8 +1412,6 @@ def main():
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         bootstrap_retries=-1,
-        read_timeout=60,
-        connect_timeout=60,
     )
 
 
