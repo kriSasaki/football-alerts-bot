@@ -35,6 +35,7 @@ KICKOFF_LOOKAROUND_SECONDS = int(os.getenv("KICKOFF_LOOKAROUND_SECONDS", "900"))
 # ─── Match start tolerance (seconds) ──────────────────
 # If match hasn't started within this time after scheduled kickoff, warn user
 MATCH_START_TOLERANCE = int(os.getenv("MATCH_START_TOLERANCE", "3600"))  # 1 hour
+BASKETBALL_PERIOD_ALERT_GRACE_SECONDS = int(os.getenv("BASKETBALL_PERIOD_ALERT_GRACE_SECONDS", "420"))
 
 # ─── Database ──────────────────────────────────────────
 DATABASE_PATH = os.getenv("DATABASE_PATH", "alerts.db")

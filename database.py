@@ -218,6 +218,16 @@ async def deactivate_alert(alert_id: int, user_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+async def deactivate_alert_by_id(alert_id: int) -> bool:
+    db = await _get_db()
+    cursor = await db.execute(
+        "UPDATE alerts SET active=0 WHERE id=? AND active=1",
+        (alert_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def deactivate_fixture_alerts(fixture_id: int, sport: str = None):
     db = await _get_db()
     if sport:

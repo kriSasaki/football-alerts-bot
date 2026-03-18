@@ -267,45 +267,41 @@ async def _show_day(query, sport: str, day_offset: int):
 
     emoji = SPORTS[sport]["emoji"]
     lines = [f"📅 <b>{day_name}, {date_display}</b>"]
-    lines.append(f"{emoji} Всего: {len(events)} матчей\n")
+    lines.append(f"{emoji} Всего матчей: <b>{len(events)}</b>\n")
 
     match_buttons = []
 
     if live_ev:
-        lines.append(f"🔴 <b>Live ({len(live_ev)}):</b>")
+        lines.append(f"🔴 <b>Сейчас в игре: {len(live_ev)}</b>")
         for ev in live_ev[:15]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_list_item(ev))}")
             else:
-                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_short(ev))}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_list_item(ev))}")
             _add_match_btn(match_buttons, ev, sport)
         lines.append("")
 
     if sched_ev:
-        lines.append(f"⏰ <b>Запланированы ({len(sched_ev)}):</b>")
+        lines.append(f"⏰ <b>Скоро начнутся: {len(sched_ev)}</b>")
         sched_ev.sort(key=lambda e: api.get_kickoff_timestamp(e))
         for ev in sched_ev[:20]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_list_item(ev))}")
             else:
-                home = api.get_home_name(ev)
-                away = api.get_away_name(ev)
-                ts = api.get_kickoff_timestamp(ev)
-                t = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "TBD"
-                lines.append(f"  <code>{eid}</code> | {_esc(home)} vs {_esc(away)} (⏰ {t})")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_list_item(ev))}")
             _add_match_btn(match_buttons, ev, sport)
         lines.append("")
 
     if fin_ev:
-        lines.append(f"✅ <b>Завершены ({len(fin_ev)}):</b>")
+        lines.append(f"✅ <b>Уже завершены: {len(fin_ev)}</b>")
         for ev in fin_ev[:10]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_list_item(ev))}")
             else:
-                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_short(ev))}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_list_item(ev))}")
         lines.append("")
 
     text = "\n".join(lines)
@@ -376,7 +372,7 @@ async def _show_live(query, sport: str):
         return
 
     emoji = SPORTS[sport]["emoji"]
-    lines = [f"⚡ <b>Live {SPORTS[sport]['label']} ({len(events)}):</b>\n"]
+    lines = [f"⚡ <b>{SPORTS[sport]['label']} live: {len(events)}</b>\n"]
     buttons = []
 
     if sport == "football":
@@ -391,13 +387,13 @@ async def _show_live(query, sport: str):
                 break
             lines.append(f"\n🏆 <b>{_esc(t_name)}</b>")
             for ev in tournaments[t_name][:5]:
-                lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_football_short(ev))}")
+                lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_football_list_item(ev))}")
                 shown += 1
     else:
         for ev in events[:15]:
-            lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_basketball_short(ev))}")
+            lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_basketball_list_item(ev))}")
 
-    lines.append("\n👇 Нажми на матч:")
+    lines.append("\n👇 Выбери матч:")
     row = []
     for ev in events[:10]:
         home = api.get_home_name(ev)[:8]
@@ -1371,6 +1367,9 @@ async def _poll_basketball(context, alerts_by_fixture: dict[int, list[dict]]):
 
         for alert in alerts:
             triggered, value, extra = check_basketball_alert(alert, parsed)
+            if extra and "expired" in extra.lower():
+                await db.deactivate_alert_by_id(alert["id"])
+                continue
             if triggered:
                 msg = format_basketball_notification(alert, value, ev, extra)
                 await _send_html_message(context.bot, alert["chat_id"], msg)

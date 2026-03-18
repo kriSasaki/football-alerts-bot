@@ -1,11 +1,12 @@
 """
-Alert Engine — checks conditions for football and basketball.
-Supports standard comparisons AND special even/odd basketball alerts.
+Alert engine for football and basketball notifications.
 """
+import html
 import logging
 import operator as op
-import html
-from config import FOOTBALL_STATS, BASKETBALL_STATS, SPORTS
+
+from config import BASKETBALL_STATS, FOOTBALL_STATS, SPORTS
+from sports_api import basketball_period_alert_is_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -13,18 +14,15 @@ logger = logging.getLogger(__name__)
 def _esc(value) -> str:
     return html.escape(str(value), quote=True)
 
+
 OPERATORS = {
-    ">":  op.gt,
-    "<":  op.lt,
+    ">": op.gt,
+    "<": op.lt,
     ">=": op.ge,
     "<=": op.le,
     "==": op.eq,
 }
 
-
-# ═════════════════════════════════════════════════════════
-#  FOOTBALL
-# ═════════════════════════════════════════════════════════
 
 def check_football_alert(alert: dict, stats: dict, event: dict) -> tuple[bool, float | None]:
     stat_key = alert["stat_key"]
@@ -55,158 +53,213 @@ def _get_football_goals(event: dict, team: str) -> float | None:
     as_ = event.get("awayScore", {}).get("current")
     if team == "home":
         return float(hs) if hs is not None else None
-    elif team == "away":
+    if team == "away":
         return float(as_) if as_ is not None else None
-    else:
-        if hs is None and as_ is None:
-            return None
-        return float((hs or 0) + (as_ or 0))
+    if hs is None and as_ is None:
+        return None
+    return float((hs or 0) + (as_ or 0))
 
 
 def _extract_football_stat(stats: dict, api_name: str, team: str) -> float | None:
     if team == "total":
-        h = _to_num(stats.get("home", {}).get(api_name))
-        a = _to_num(stats.get("away", {}).get(api_name))
-        if h is None and a is None:
+        home = _to_num(stats.get("home", {}).get(api_name))
+        away = _to_num(stats.get("away", {}).get(api_name))
+        if home is None and away is None:
             return None
-        return (h or 0) + (a or 0)
+        return (home or 0) + (away or 0)
     return _to_num(stats.get(team, {}).get(api_name))
 
-
-# ═════════════════════════════════════════════════════════
-#  BASKETBALL
-# ═════════════════════════════════════════════════════════
 
 def check_basketball_alert(alert: dict, parsed_scores: dict) -> tuple[bool, float | None, str]:
     stat_key = alert["stat_key"]
     threshold = alert["threshold"]
     oper_str = alert["operator"]
 
-    # Special even/odd alerts
     if stat_key == "q1_even":
-        val = parsed_scores.get("q1_even")
-        if val is None:
-            return False, None, "Q1 ещё не сыгран"
-        qt = parsed_scores.get("q1_total", 0)
-        if val:
-            return True, float(qt), f"Q1 тотал = {qt} (ЧЁТ ✅)"
-        return False, float(qt), f"Q1 тотал = {qt} (НЕЧЕТ)"
-
+        return _check_even_period(parsed_scores, "q1")
     if stat_key == "q2_even":
-        val = parsed_scores.get("q2_even")
-        if val is None:
-            return False, None, "Q2 ещё не сыгран"
-        qt = parsed_scores.get("q2_total", 0)
-        if val:
-            return True, float(qt), f"Q2 тотал = {qt} (ЧЁТ ✅)"
-        return False, float(qt), f"Q2 тотал = {qt} (НЕЧЕТ)"
-
+        return _check_even_period(parsed_scores, "q2")
     if stat_key == "q1q2_even":
-        val = parsed_scores.get("q1q2_even")
-        if val is None:
-            return False, None, "Q1 и Q2 ещё не оба сыграны"
-        q1t = parsed_scores.get("q1_total", 0)
-        q2t = parsed_scores.get("q2_total", 0)
-        q1e = "ЧЁТ" if parsed_scores.get("q1_even") else "НЕЧЕТ"
-        q2e = "ЧЁТ" if parsed_scores.get("q2_even") else "НЕЧЕТ"
-        info = f"Q1={q1t}({q1e}), Q2={q2t}({q2e})"
-        if val:
-            return True, float(q1t + q2t), f"Q1+Q2 ОБЕ ЧЁТНЫЕ ✅\n{info}"
-        return False, float(q1t + q2t), f"Не обе чётные\n{info}"
+        return _check_even_pair(parsed_scores)
 
-    # Standard numeric alerts
     compare_fn = OPERATORS.get(oper_str)
     if not compare_fn:
         return False, None, ""
 
     field_map = {
-        "points":   "points",
+        "points": "points",
         "q1_total": "q1_total",
         "q2_total": "q2_total",
         "q3_total": "q3_total",
         "q4_total": "q4_total",
-        "half1":    "half1_total",
+        "half1": "half1_total",
     }
+    final_flags = {
+        "q1_total": "q1_finished",
+        "q2_total": "q2_finished",
+        "q3_total": "q3_finished",
+        "q4_total": "q4_finished",
+        "half1_total": "half1_finished",
+    }
+
     field = field_map.get(stat_key)
     if not field:
-        return False, None, f"Неизвестный stat: {stat_key}"
+        return False, None, f"Unknown stat: {stat_key}"
+
+    final_flag = final_flags.get(field)
+    if final_flag and not parsed_scores.get(final_flag):
+        return False, None, "Period is not finished yet"
+    if field == "q1_total" and not basketball_period_alert_is_fresh(parsed_scores, 1):
+        return False, None, "Q1 alert window has expired"
+    if field in {"q2_total", "half1_total"} and not basketball_period_alert_is_fresh(parsed_scores, 2):
+        return False, None, "Q2 alert window has expired"
+    if field == "q3_total" and not basketball_period_alert_is_fresh(parsed_scores, 3):
+        return False, None, "Q3 alert window has expired"
+    if field == "q4_total" and not basketball_period_alert_is_fresh(parsed_scores, 4):
+        return False, None, "Q4 alert window has expired"
 
     value = parsed_scores.get(field)
     if value is None:
-        return False, None, "Данные ещё недоступны"
+        return False, None, "Data is not available yet"
 
     value = float(value)
-    triggered = compare_fn(value, threshold)
-    return triggered, value, ""
+    return compare_fn(value, threshold), value, ""
 
 
-# ═════════════════════════════════════════════════════════
-#  LIVE STATS STRING (for alert status display)
-# ═════════════════════════════════════════════════════════
+def _check_even_period(parsed_scores: dict, period_key: str) -> tuple[bool, float | None, str]:
+    finished_key = f"{period_key}_finished"
+    total_key = f"{period_key}_total"
+    even_key = f"{period_key}_even"
+    label = period_key.upper()
+
+    if not parsed_scores.get(finished_key):
+        return False, None, f"{label} is not finished yet"
+    if not basketball_period_alert_is_fresh(parsed_scores, int(period_key[1:])):
+        return False, None, f"{label} alert window has expired"
+
+    total = parsed_scores.get(total_key)
+    if total is None:
+        return False, None, f"{label} data unavailable"
+
+    if parsed_scores.get(even_key):
+        return True, float(total), f"{label} total = {total} (EVEN)"
+    return False, float(total), f"{label} total = {total} (ODD)"
+
+
+def _check_even_pair(parsed_scores: dict) -> tuple[bool, float | None, str]:
+    if not parsed_scores.get("q1_finished") or not parsed_scores.get("q2_finished"):
+        return False, None, "Q1 and Q2 are not both finished yet"
+    if not basketball_period_alert_is_fresh(parsed_scores, 2):
+        return False, None, "Q1/Q2 alert window has expired"
+
+    q1_total = parsed_scores.get("q1_total")
+    q2_total = parsed_scores.get("q2_total")
+    if q1_total is None or q2_total is None:
+        return False, None, "Q1/Q2 data unavailable"
+
+    q1_state = "EVEN" if parsed_scores.get("q1_even") else "ODD"
+    q2_state = "EVEN" if parsed_scores.get("q2_even") else "ODD"
+    info = f"Q1={q1_total}({q1_state}), Q2={q2_total}({q2_state})"
+
+    if parsed_scores.get("q1q2_even"):
+        return True, float(q1_total + q2_total), f"Q1+Q2 BOTH EVEN\n{info}"
+    return False, float(q1_total + q2_total), f"Not both even\n{info}"
+
 
 def format_live_alert_status(alert: dict, stats: dict = None, event: dict = None, parsed_bb: dict = None) -> str:
-    """Return a short status line for an alert showing current value."""
     sport = alert.get("sport", "football")
     stat_key = alert["stat_key"]
 
     if sport == "football":
         if event is None:
-            return "⏳ нет данных"
-        from sports_api import is_live, is_finished, is_not_started
+            return "No data"
+        from sports_api import is_finished, is_not_started
+
         if is_not_started(event):
-            return "⏰ не начался"
+            return "Not started yet"
         if is_finished(event):
-            return "✅ завершён"
+            return "Finished"
 
         if stat_key == "goals":
-            val = _get_football_goals(event, alert.get("team", "total"))
+            value = _get_football_goals(event, alert.get("team", "total"))
         else:
             info = FOOTBALL_STATS.get(stat_key)
-            if info and stats:
-                val = _extract_football_stat(stats, info["api_name"], alert.get("team", "total"))
-            else:
-                val = None
-        if val is not None:
-            return f"📊 {val} (нужно {alert['operator']} {alert['threshold']})"
-        return "⏳ стат недоступна"
+            value = _extract_football_stat(stats, info["api_name"], alert.get("team", "total")) if info and stats else None
+        if value is not None:
+            return f"{value} (need {alert['operator']} {alert['threshold']})"
+        return "Stat unavailable"
 
-    elif sport == "basketball":
+    if sport == "basketball":
         if parsed_bb is None:
-            return "⏳ нет данных"
+            return "No data"
 
-        special_keys = {"q1_even", "q2_even", "q1q2_even"}
-        if stat_key in special_keys:
-            q_key = stat_key.replace("_even", "_total") if stat_key != "q1q2_even" else None
-            if stat_key == "q1_even":
-                qt = parsed_bb.get("q1_total")
-                if qt is None: return "⏳ Q1 не сыгран"
-                return f"Q1={qt} ({'ЧЁТ ✅' if qt % 2 == 0 else 'НЕЧЕТ ❌'})"
-            elif stat_key == "q2_even":
-                qt = parsed_bb.get("q2_total")
-                if qt is None: return "⏳ Q2 не сыгран"
-                return f"Q2={qt} ({'ЧЁТ ✅' if qt % 2 == 0 else 'НЕЧЕТ ❌'})"
-            elif stat_key == "q1q2_even":
-                q1 = parsed_bb.get("q1_total")
-                q2 = parsed_bb.get("q2_total")
-                if q1 is None: return "⏳ Q1 не сыгран"
-                if q2 is None: return f"Q1={q1}, Q2 в процессе"
-                return f"Q1={q1}+Q2={q2} ({'ОБЕ ЧЁТ ✅' if parsed_bb.get('q1q2_even') else '❌'})"
+        if stat_key == "q1_even":
+            if not parsed_bb.get("q1_finished"):
+                return "Q1 is still in progress"
+            if not basketball_period_alert_is_fresh(parsed_bb, 1):
+                return "Q1 alert window has expired"
+            total = parsed_bb.get("q1_total")
+            if total is None:
+                return "Q1 data unavailable"
+            return f"Q1={total} ({'EVEN' if total % 2 == 0 else 'ODD'})"
 
-        field_map = {"points": "points", "q1_total": "q1_total", "q2_total": "q2_total",
-                     "q3_total": "q3_total", "q4_total": "q4_total", "half1": "half1_total"}
+        if stat_key == "q2_even":
+            if not parsed_bb.get("q2_finished"):
+                return "Q2 is still in progress"
+            if not basketball_period_alert_is_fresh(parsed_bb, 2):
+                return "Q2 alert window has expired"
+            total = parsed_bb.get("q2_total")
+            if total is None:
+                return "Q2 data unavailable"
+            return f"Q2={total} ({'EVEN' if total % 2 == 0 else 'ODD'})"
+
+        if stat_key == "q1q2_even":
+            if not parsed_bb.get("q1_finished") or not parsed_bb.get("q2_finished"):
+                return "Waiting for Q1 and Q2 to finish"
+            if not basketball_period_alert_is_fresh(parsed_bb, 2):
+                return "Q1/Q2 alert window has expired"
+            q1_total = parsed_bb.get("q1_total")
+            q2_total = parsed_bb.get("q2_total")
+            if q1_total is None or q2_total is None:
+                return "Q1/Q2 data unavailable"
+            state = "BOTH EVEN" if parsed_bb.get("q1q2_even") else "NOT BOTH EVEN"
+            return f"Q1={q1_total}+Q2={q2_total} ({state})"
+
+        field_map = {
+            "points": "points",
+            "q1_total": "q1_total",
+            "q2_total": "q2_total",
+            "q3_total": "q3_total",
+            "q4_total": "q4_total",
+            "half1": "half1_total",
+        }
+        final_flags = {
+            "q1_total": "q1_finished",
+            "q2_total": "q2_finished",
+            "q3_total": "q3_finished",
+            "q4_total": "q4_finished",
+            "half1_total": "half1_finished",
+        }
         field = field_map.get(stat_key)
         if field:
-            val = parsed_bb.get(field)
-            if val is not None:
-                return f"📊 {val} (нужно {alert['operator']} {alert['threshold']})"
-        return "⏳ данные недоступны"
+            final_flag = final_flags.get(field)
+            if final_flag and not parsed_bb.get(final_flag):
+                return "Period is not finished yet"
+            if field == "q1_total" and not basketball_period_alert_is_fresh(parsed_bb, 1):
+                return "Q1 alert window has expired"
+            if field in {"q2_total", "half1_total"} and not basketball_period_alert_is_fresh(parsed_bb, 2):
+                return "Q2 alert window has expired"
+            if field == "q3_total" and not basketball_period_alert_is_fresh(parsed_bb, 3):
+                return "Q3 alert window has expired"
+            if field == "q4_total" and not basketball_period_alert_is_fresh(parsed_bb, 4):
+                return "Q4 alert window has expired"
+            value = parsed_bb.get(field)
+            if value is not None:
+                return f"{value} (need {alert['operator']} {alert['threshold']})"
+        return "Data unavailable"
 
     return "?"
 
-
-# ═════════════════════════════════════════════════════════
-#  FORMATTING
-# ═════════════════════════════════════════════════════════
 
 def format_football_notification(alert: dict, value: float, event: dict) -> str:
     home = event.get("homeTeam", {}).get("name", "?")
@@ -214,6 +267,7 @@ def format_football_notification(alert: dict, value: float, event: dict) -> str:
     hs = event.get("homeScore", {}).get("current", "?")
     as_ = event.get("awayScore", {}).get("current", "?")
     from sports_api import get_minute
+
     minute = get_minute(event)
     stat_display = alert["stat_key"].replace("_", " ").title()
 
@@ -228,55 +282,42 @@ def format_football_notification(alert: dict, value: float, event: dict) -> str:
 
 def format_basketball_notification(alert: dict, value: float, event: dict, extra: str = "") -> str:
     from sports_api import parse_basketball_scores
-    s = parse_basketball_scores(event)
 
+    scores = parse_basketball_scores(event)
     stat_info = BASKETBALL_STATS.get(alert["stat_key"], {})
     stat_label = stat_info.get("label", alert["stat_key"])
 
     lines = [
-        f"🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n",
-        f"🏀 {_esc(s['home_name'])} {s['home_total'] or 0}:{s['away_total'] or 0} {_esc(s['away_name'])}",
-        f"📍 {_esc(s['status_desc'] or s['status_type'] or '?')}\n",
+        "🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n",
+        f"🏀 {_esc(scores['home_name'])} {scores['home_total'] or 0}:{scores['away_total'] or 0} {_esc(scores['away_name'])}",
+        f"📍 {_esc(scores['status_desc'] or scores['status_type'] or '?')}\n",
     ]
 
-    for i in range(4):
-        qt = s.get(f"q{i+1}_total")
-        if qt is not None:
-            parity = "ЧЁТ ✅" if qt % 2 == 0 else "НЕЧЕТ"
-            lines.append(f"  Q{i+1}: {qt} ({parity})")
+    for idx in range(4):
+        total = scores.get(f"q{idx + 1}_total")
+        if total is not None:
+            parity = "ЧЁТ ✅" if total % 2 == 0 else "НЕЧЕТ"
+            lines.append(f"  Q{idx + 1}: {total} ({parity})")
 
     lines.append(f"\n📊 <b>{_esc(stat_label)}:</b> {value}")
     if extra:
         lines.append(f"ℹ️ {_esc(extra)}")
     lines.append(f"\n🎯 Алерт #{alert['id']} ✅")
-
     return "\n".join(lines)
 
 
 def format_alert_summary(alert: dict) -> str:
     sport_emoji = SPORTS.get(alert.get("sport", "football"), {}).get("emoji", "🏟")
     stat_key = alert["stat_key"]
-
     special_labels = {
-        "q1_even":   "Q1 чётный",
-        "q2_even":   "Q2 чётный",
+        "q1_even": "Q1 чётный",
+        "q2_even": "Q2 чётный",
         "q1q2_even": "Q1+Q2 чётные",
     }
     stat_display = special_labels.get(stat_key, stat_key)
+    team_str = f" [{alert['team']}]" if alert["team"] != "total" else ""
+    return f"{sport_emoji} #{alert['id']} | {stat_display}{team_str} {alert['operator']} {alert['threshold']}"
 
-    team_str = ""
-    if alert["team"] != "total":
-        team_str = f" [{alert['team']}]"
-
-    return (
-        f"{sport_emoji} #{alert['id']} | "
-        f"{stat_display}{team_str} {alert['operator']} {alert['threshold']}"
-    )
-
-
-# ═════════════════════════════════════════════════════════
-#  HELPERS
-# ═════════════════════════════════════════════════════════
 
 def _to_num(value) -> float | None:
     if value is None:

@@ -13,6 +13,7 @@ import logging
 import time
 import json
 import html
+import re
 from datetime import datetime, timezone
 
 from config import (
@@ -22,6 +23,7 @@ from config import (
     EVENT_CACHE_TTL,
     STATS_CACHE_TTL,
     SCHEDULE_CACHE_TTL,
+    BASKETBALL_PERIOD_ALERT_GRACE_SECONDS,
 )
 
 logger = logging.getLogger(__name__)
@@ -643,6 +645,12 @@ def parse_basketball_scores(event: dict) -> dict:
     half1 = (q_totals[0] + q_totals[1]) if (q_totals[0] is not None and q_totals[1] is not None) else None
 
     status = get_event_status(event)
+    desc = (status["description"] or event.get("statusDescription") or "").lower()
+    current_period, clock_seconds = _basketball_live_phase(desc)
+    q1_finished = _basketball_period_finished(1, status["type"], desc)
+    q2_finished = _basketball_period_finished(2, status["type"], desc)
+    q3_finished = _basketball_period_finished(3, status["type"], desc)
+    q4_finished = _basketball_period_finished(4, status["type"], desc)
 
     return {
         "home_name": get_home_name(event),
@@ -653,13 +661,94 @@ def parse_basketball_scores(event: dict) -> dict:
         "away_q": away_q,
         "status_type": status["type"],
         "status_desc": status["description"],
+        "current_period": current_period,
+        "clock_seconds": clock_seconds,
         "points": (home_total_int or 0) + (away_total_int or 0),
         "q1_total": q_totals[0], "q2_total": q_totals[1],
         "q3_total": q_totals[2], "q4_total": q_totals[3],
+        "q1_finished": q1_finished, "q2_finished": q2_finished,
+        "q3_finished": q3_finished, "q4_finished": q4_finished,
+        "half1_finished": q2_finished,
         "q1_even": q_even[0], "q2_even": q_even[1],
         "q3_even": q_even[2], "q4_even": q_even[3],
         "q1q2_even": q1q2_even, "half1_total": half1,
     }
+
+
+def _basketball_period_finished(period: int, status_type: str, desc: str) -> bool:
+    if status_type == "finished":
+        return True
+    if status_type == "notstarted":
+        return False
+
+    normalized = desc.lower().strip()
+    if any(token in normalized for token in ("overtime", "ot", "extra time")):
+        return True
+    if any(token in normalized for token in ("halftime", "half time", "interval", "break")):
+        return period <= 2
+
+    quarter_markers = {
+        1: ("q1", "1q", "1st quarter", "first quarter"),
+        2: ("q2", "2q", "2nd quarter", "second quarter"),
+        3: ("q3", "3q", "3rd quarter", "third quarter"),
+        4: ("q4", "4q", "4th quarter", "fourth quarter"),
+    }
+    current_period = 0
+    for idx, markers in quarter_markers.items():
+        if any(marker in normalized for marker in markers):
+            current_period = idx
+            break
+
+    if current_period == 0:
+        match = re.search(r"\b([1-4])\s*(?:st|nd|rd|th)?\s*(?:q|quarter)\b", normalized)
+        if match:
+            current_period = int(match.group(1))
+
+    if current_period == 0:
+        return False
+    return current_period > period
+
+
+def _basketball_live_phase(desc: str) -> tuple[int, int | None]:
+    normalized = (desc or "").lower().strip()
+    quarter_markers = {
+        1: ("q1", "1q", "1st quarter", "first quarter"),
+        2: ("q2", "2q", "2nd quarter", "second quarter"),
+        3: ("q3", "3q", "3rd quarter", "third quarter"),
+        4: ("q4", "4q", "4th quarter", "fourth quarter"),
+    }
+    current_period = 0
+    for idx, markers in quarter_markers.items():
+        if any(marker in normalized for marker in markers):
+            current_period = idx
+            break
+
+    if current_period == 0:
+        match = re.search(r"\b([1-4])\s*(?:st|nd|rd|th)?\s*(?:q|quarter)\b", normalized)
+        if match:
+            current_period = int(match.group(1))
+
+    clock_match = re.search(r"\b(\d{1,2}):(\d{2})\b", normalized)
+    if clock_match:
+        minutes = int(clock_match.group(1))
+        seconds = int(clock_match.group(2))
+        return current_period, (minutes * 60 + seconds)
+    return current_period, None
+
+
+def basketball_period_alert_is_fresh(parsed_scores: dict, target_period: int) -> bool:
+    current_period = parsed_scores.get("current_period", 0) or 0
+    clock_seconds = parsed_scores.get("clock_seconds")
+
+    if current_period == 0:
+        return True
+    if current_period <= target_period:
+        return True
+    if current_period > target_period + 1:
+        return False
+    if clock_seconds is None:
+        return True
+    return clock_seconds >= max(0, 600 - BASKETBALL_PERIOD_ALERT_GRACE_SECONDS)
 
 
 def format_basketball_short(event: dict) -> str:
@@ -719,3 +808,45 @@ def to_number(value) -> float | None:
         except ValueError:
             return None
     return None
+
+
+def format_football_list_item(event: dict) -> str:
+    home = get_home_name(event)
+    away = get_away_name(event)
+    hs = get_home_score(event)
+    as_ = get_away_score(event)
+
+    if is_not_started(event):
+        ts = get_kickoff_timestamp(event)
+        t = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "TBD"
+        return f"{home} - {away} | старт {t}"
+    if is_finished(event):
+        return f"{home} {hs}:{as_} {away} | завершен"
+    if is_canceled_or_postponed(event):
+        return f"{home} - {away} | отменен"
+
+    minute = get_minute(event) or "live"
+    return f"{home} {hs if hs is not None else '?'}:{as_ if as_ is not None else '?'} {away} | {minute}"
+
+
+def format_basketball_list_item(event: dict) -> str:
+    s = parse_basketball_scores(event)
+    home_total = s["home_total"] if s["home_total"] is not None else 0
+    away_total = s["away_total"] if s["away_total"] is not None else 0
+
+    if s["status_type"] == "finished":
+        status = "завершен"
+    elif s["status_type"] == "notstarted":
+        status = "не начался"
+    elif s.get("current_period"):
+        status = f"Q{s['current_period']}"
+    else:
+        status = s["status_desc"] or "live"
+
+    quarter_parts = []
+    for idx in range(4):
+        total = s.get(f"q{idx + 1}_total")
+        if total is not None:
+            quarter_parts.append(f"Q{idx + 1}:{total}")
+    quarters = f" | {' '.join(quarter_parts)}" if quarter_parts else ""
+    return f"{s['home_name']} {home_total}:{away_total} {s['away_name']} | {status}{quarters}"
