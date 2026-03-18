@@ -4,9 +4,14 @@ Supports standard comparisons AND special even/odd basketball alerts.
 """
 import logging
 import operator as op
+import html
 from config import FOOTBALL_STATS, BASKETBALL_STATS, SPORTS
 
 logger = logging.getLogger(__name__)
+
+
+def _esc(value) -> str:
+    return html.escape(str(value), quote=True)
 
 OPERATORS = {
     ">":  op.gt,
@@ -214,9 +219,9 @@ def format_football_notification(alert: dict, value: float, event: dict) -> str:
 
     return (
         f"🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n\n"
-        f"⚽ {home} {hs}:{as_} {away} ({minute})\n\n"
-        f"📊 <b>{stat_display}:</b> {value}\n"
-        f"🎯 Условие: {alert['stat_key']} {alert['operator']} {alert['threshold']}\n\n"
+        f"⚽ {_esc(home)} {hs}:{as_} {_esc(away)} ({_esc(minute)})\n\n"
+        f"📊 <b>{_esc(stat_display)}:</b> {value}\n"
+        f"🎯 Условие: {_esc(alert['stat_key'])} {alert['operator']} {alert['threshold']}\n\n"
         f"Алерт #{alert['id']} ✅"
     )
 
@@ -230,8 +235,8 @@ def format_basketball_notification(alert: dict, value: float, event: dict, extra
 
     lines = [
         f"🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n",
-        f"🏀 {s['home_name']} {s['home_total'] or 0}:{s['away_total'] or 0} {s['away_name']}",
-        f"📍 {s['status_desc'] or s['status_type'] or '?'}\n",
+        f"🏀 {_esc(s['home_name'])} {s['home_total'] or 0}:{s['away_total'] or 0} {_esc(s['away_name'])}",
+        f"📍 {_esc(s['status_desc'] or s['status_type'] or '?')}\n",
     ]
 
     for i in range(4):
@@ -240,9 +245,9 @@ def format_basketball_notification(alert: dict, value: float, event: dict, extra
             parity = "ЧЁТ ✅" if qt % 2 == 0 else "НЕЧЕТ"
             lines.append(f"  Q{i+1}: {qt} ({parity})")
 
-    lines.append(f"\n📊 <b>{stat_label}:</b> {value}")
+    lines.append(f"\n📊 <b>{_esc(stat_label)}:</b> {value}")
     if extra:
-        lines.append(f"ℹ️ {extra}")
+        lines.append(f"ℹ️ {_esc(extra)}")
     lines.append(f"\n🎯 Алерт #{alert['id']} ✅")
 
     return "\n".join(lines)

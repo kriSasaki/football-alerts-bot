@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 import json
+import html
 from datetime import datetime, timezone
 
 from config import (
@@ -24,6 +25,10 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _esc(value) -> str:
+    return html.escape(str(value), quote=True)
 
 # ═══════════════════════════════════════════════════════
 #  HTTP CLIENT — curl_cffi with Chrome impersonation
@@ -672,10 +677,10 @@ def format_basketball_detail(event: dict) -> str:
     s = parse_basketball_scores(event)
     tournament = get_tournament_name(event)
 
-    lines = [f"🏀 <b>{s['home_name']} {s['home_total'] or 0}:{s['away_total'] or 0} {s['away_name']}</b>"]
+    lines = [f"🏀 <b>{_esc(s['home_name'])} {s['home_total'] or 0}:{s['away_total'] or 0} {_esc(s['away_name'])}</b>"]
     if tournament:
-        lines.append(f"🏆 {tournament}")
-    lines.append(f"📍 {s['status_desc'] or s['status_type'] or '?'}")
+        lines.append(f"🏆 {_esc(tournament)}")
+    lines.append(f"📍 {_esc(s['status_desc'] or s['status_type'] or '?')}")
     lines.append("\n📊 <b>По четвертям:</b>")
     for i in range(4):
         qt = s.get(f"q{i+1}_total")

@@ -14,6 +14,7 @@ import asyncio
 import time
 import os
 import sys
+import html
 import httpx
 from types import SimpleNamespace
 from datetime import datetime, timedelta
@@ -98,6 +99,24 @@ logging.getLogger("apscheduler").setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 _poll_lock = asyncio.Lock()
 _web_runner = None
+_schedule_prefetch_inflight: set[tuple[str, str]] = set()
+
+
+def _esc(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _plain_from_html(text: str) -> str:
+    plain = text
+    for old, new in (
+        ("<b>", ""), ("</b>", ""),
+        ("<i>", ""), ("</i>", ""),
+        ("<code>", ""), ("</code>", ""),
+        ("&lt;", "<"), ("&gt;", ">"),
+        ("&amp;", "&"), ("&quot;", '"'),
+    ):
+        plain = plain.replace(old, new)
+    return plain
 
 # ═══════════════════════════════════════════════════════
 #  SAFE TELEGRAM EDIT (suppress common errors)
@@ -121,6 +140,12 @@ async def _safe_edit(query, text: str, keyboard=None):
                     reply_markup=keyboard)
             except Exception:
                 pass
+        elif "Can't parse entities" in err_str:
+            plain = _plain_from_html(text)
+            try:
+                await query.edit_message_text(plain, reply_markup=keyboard)
+            except Exception:
+                await query.message.reply_text(plain, reply_markup=keyboard)
         else:
             raise
 
@@ -155,7 +180,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=admin_id,
                     text=(
                         f"🔐 <b>Запрос доступа</b>\n\n"
-                        f"👤 {name} ({username})\n"
+                        f"👤 {_esc(name)} ({_esc(username)})\n"
                         f"🆔 <code>{user_id}</code>"
                     ),
                     parse_mode=ParseMode.HTML,
@@ -227,6 +252,7 @@ async def _show_day(query, sport: str, day_offset: int):
         events = await api.football_by_date(date_str)
     else:
         events = await api.basketball_by_date(date_str)
+    _schedule_prefetch_window(sport, day_offset)
 
     if not events:
         text = f"📅 <b>{day_name}, {date_display}</b>\n\nНет матчей на этот день."
@@ -250,9 +276,9 @@ async def _show_day(query, sport: str, day_offset: int):
         for ev in live_ev[:15]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {api.format_football_short(ev)}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
             else:
-                lines.append(f"  <code>{eid}</code> | {api.format_basketball_short(ev)}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_short(ev))}")
             _add_match_btn(match_buttons, ev, sport)
         lines.append("")
 
@@ -262,13 +288,13 @@ async def _show_day(query, sport: str, day_offset: int):
         for ev in sched_ev[:20]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {api.format_football_short(ev)}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
             else:
                 home = api.get_home_name(ev)
                 away = api.get_away_name(ev)
                 ts = api.get_kickoff_timestamp(ev)
                 t = datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "TBD"
-                lines.append(f"  <code>{eid}</code> | {home} vs {away} (⏰ {t})")
+                lines.append(f"  <code>{eid}</code> | {_esc(home)} vs {_esc(away)} (⏰ {t})")
             _add_match_btn(match_buttons, ev, sport)
         lines.append("")
 
@@ -277,9 +303,9 @@ async def _show_day(query, sport: str, day_offset: int):
         for ev in fin_ev[:10]:
             eid = api.get_event_id(ev)
             if sport == "football":
-                lines.append(f"  <code>{eid}</code> | {api.format_football_short(ev)}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_football_short(ev))}")
             else:
-                lines.append(f"  <code>{eid}</code> | {api.format_basketball_short(ev)}")
+                lines.append(f"  <code>{eid}</code> | {_esc(api.format_basketball_short(ev))}")
         lines.append("")
 
     text = "\n".join(lines)
@@ -363,13 +389,13 @@ async def _show_live(query, sport: str):
         for t_name in sorted(tournaments.keys()):
             if shown >= 20:
                 break
-            lines.append(f"\n🏆 <b>{t_name}</b>")
+            lines.append(f"\n🏆 <b>{_esc(t_name)}</b>")
             for ev in tournaments[t_name][:5]:
-                lines.append(f"  <code>{api.get_event_id(ev)}</code> | {api.format_football_short(ev)}")
+                lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_football_short(ev))}")
                 shown += 1
     else:
         for ev in events[:15]:
-            lines.append(f"  <code>{api.get_event_id(ev)}</code> | {api.format_basketball_short(ev)}")
+            lines.append(f"  <code>{api.get_event_id(ev)}</code> | {_esc(api.format_basketball_short(ev))}")
 
     lines.append("\n👇 Нажми на матч:")
     row = []
@@ -397,6 +423,29 @@ async def _show_live(query, sport: str):
     if len(text) > 4000:
         text = text[:4000] + "\n\n..."
     await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+def _schedule_prefetch_window(sport: str, day_offset: int):
+    for neighbor in (day_offset - 1, day_offset + 1):
+        if -7 <= neighbor <= 7:
+            date_str = (datetime.now() + timedelta(days=neighbor)).strftime("%Y-%m-%d")
+            key = (sport, date_str)
+            if key in _schedule_prefetch_inflight:
+                continue
+            _schedule_prefetch_inflight.add(key)
+            asyncio.create_task(_prefetch_day(sport, date_str))
+
+
+async def _prefetch_day(sport: str, date_str: str):
+    try:
+        if sport == "football":
+            await api.football_by_date(date_str)
+        else:
+            await api.basketball_by_date(date_str)
+    except Exception as e:
+        logger.debug("Schedule prefetch failed [%s %s]: %s", sport, date_str, e)
+    finally:
+        _schedule_prefetch_inflight.discard((sport, date_str))
 
 
 # ═══════════════════════════════════════════════════════
@@ -432,10 +481,10 @@ async def _show_match(query, sport, match_id):
 
 
 def _format_football_detail(ev, stats):
-    lines = [f"⚽ <b>{api.format_football_short(ev)}</b>"]
+    lines = [f"⚽ <b>{_esc(api.format_football_short(ev))}</b>"]
     t_name = api.get_tournament_name(ev)
     if t_name:
-        lines.append(f"🏆 {t_name}")
+        lines.append(f"🏆 {_esc(t_name)}")
 
     if api.is_not_started(ev):
         ts = api.get_kickoff_timestamp(ev)
@@ -494,14 +543,15 @@ async def _handle_alert_stat_selected(query, context, sport, match_id, stat_key)
 
     # Auto-create alerts for even/odd types (no threshold needed)
     if stat_key in ("q1_even", "q2_even", "q1q2_even"):
-        kickoff_at = await _get_kickoff_for_alert(sport, match_id)
-        match_label = await _get_match_label(sport, match_id)
+        match_meta = await _get_match_meta(sport, match_id)
+        kickoff_at = match_meta["kickoff_at"]
+        match_label = match_meta["match_label"]
         alert_id = await db.add_alert(
             user_id=query.from_user.id, chat_id=query.message.chat_id,
             fixture_id=match_id, stat_key=stat_key, operator="==", threshold=1,
             team="total", sport=sport, kickoff_at=kickoff_at, match_label=match_label)
         await query.edit_message_text(
-            f"✅ <b>Алерт #{alert_id} создан!</b>\n\n🏀 {match_label}\n📊 Тип: <b>{label}</b>\n{_scheduled_text(kickoff_at)}",
+            f"✅ <b>Алерт #{alert_id} создан!</b>\n\n🏀 {_esc(match_label)}\n📊 Тип: <b>{_esc(label)}</b>\n{_scheduled_text(kickoff_at)}",
             parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Ещё алерт", callback_data=f"alert_type:{sport}:{match_id}")],
                 [InlineKeyboardButton("📋 Мои алерты", callback_data="myalerts")],
@@ -535,22 +585,23 @@ async def _handle_alert_stat_selected(query, context, sport, match_id, stat_key)
         buttons.append(row)
     buttons.append([InlineKeyboardButton("« Назад", callback_data=f"alert_type:{sport}:{match_id}")])
     await query.edit_message_text(
-        f"📊 <b>{label}</b> | Матч {match_id}\n\nВыбери условие или напиши своё:\n<code>> 8</code> или <code>>= 5 home</code>",
+        f"📊 <b>{_esc(label)}</b> | Матч {match_id}\n\nВыбери условие или напиши своё:\n<code>> 8</code> или <code>>= 5 home</code>",
         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def _handle_quick_alert(query, sport, match_id, stat_key, condition):
     parts = condition.split()
     oper, threshold = parts[0], float(parts[1])
-    kickoff_at = await _get_kickoff_for_alert(sport, match_id)
-    match_label = await _get_match_label(sport, match_id)
+    match_meta = await _get_match_meta(sport, match_id)
+    kickoff_at = match_meta["kickoff_at"]
+    match_label = match_meta["match_label"]
     alert_id = await db.add_alert(
         user_id=query.from_user.id, chat_id=query.message.chat_id,
         fixture_id=match_id, stat_key=stat_key, operator=oper, threshold=threshold,
         team="total", sport=sport, kickoff_at=kickoff_at, match_label=match_label)
     stat_label = (FOOTBALL_STATS if sport == "football" else BASKETBALL_STATS).get(stat_key, {}).get("label", stat_key)
     await query.edit_message_text(
-        f"✅ <b>Алерт #{alert_id} создан!</b>\n\n{SPORTS[sport]['emoji']} {match_label}\n📊 {stat_label} {oper} {threshold}\n{_scheduled_text(kickoff_at)}",
+        f"✅ <b>Алерт #{alert_id} создан!</b>\n\n{SPORTS[sport]['emoji']} {_esc(match_label)}\n📊 {_esc(stat_label)} {oper} {threshold}\n{_scheduled_text(kickoff_at)}",
         parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Ещё алерт", callback_data=f"alert_type:{sport}:{match_id}")],
             [InlineKeyboardButton("📋 Мои алерты", callback_data="myalerts")],
@@ -697,7 +748,9 @@ async def _show_my_alerts(query, page=0):
     for a in page_alerts:
         summary = format_alert_summary(a)
         if a.get("match_label"):
-            summary = f"{SPORTS.get(a['sport'], {}).get('emoji', '🏟')} {a['match_label']}\n{summary}"
+            summary = f"{SPORTS.get(a['sport'], {}).get('emoji', '🏟')} {_esc(a['match_label'])}\n{_esc(summary)}"
+        else:
+            summary = _esc(summary)
 
         if a.get("kickoff_at", 0) > now:
             summary += f"\n   ⏰ Ждёт начала: {datetime.fromtimestamp(a['kickoff_at']).strftime('%d.%m %H:%M')}"
@@ -757,7 +810,7 @@ async def _show_alert_status(query, alert_id):
                 if api.is_live(ev):
                     stats = await api.football_statistics(fid)
                 status_line = format_live_alert_status(alert, stats=stats, event=ev)
-                match_info = api.format_football_short(ev)
+                match_info = _esc(api.format_football_short(ev))
             else:
                 status_line = "❌ матч не найден"
                 match_info = f"ID: {fid}"
@@ -766,7 +819,7 @@ async def _show_alert_status(query, alert_id):
             if ev:
                 parsed = api.parse_basketball_scores(ev)
                 status_line = format_live_alert_status(alert, parsed_bb=parsed)
-                match_info = f"{parsed['home_name']} {parsed['home_total'] or 0}:{parsed['away_total'] or 0} {parsed['away_name']}"
+                match_info = f"{_esc(parsed['home_name'])} {parsed['home_total'] or 0}:{parsed['away_total'] or 0} {_esc(parsed['away_name'])}"
             else:
                 status_line = "❌ матч не найден"
                 match_info = f"ID: {fid}"
@@ -775,12 +828,12 @@ async def _show_alert_status(query, alert_id):
         status_line = f"❌ ошибка: {e}"
         match_info = f"ID: {fid}"
 
-    stat_label = format_alert_summary(alert)
+    stat_label = _esc(format_alert_summary(alert))
     text = (
         f"📊 <b>Статус алерта #{alert_id}</b>\n\n"
         f"{SPORTS.get(sport, {}).get('emoji', '')} {match_info}\n"
         f"{stat_label}\n\n"
-        f"<b>Текущее значение:</b> {status_line}"
+        f"<b>Текущее значение:</b> {_esc(status_line)}"
     )
     await query.edit_message_text(
         text, parse_mode=ParseMode.HTML,
@@ -835,7 +888,8 @@ async def cmd_web(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = issue_web_token(user_id)
     url = f"{public_url.rstrip('/')}/?token={token}"
     await update.message.reply_text(
-        f"🌐 <b>Твоя персональная ссылка</b>\n\n{url}\n\nНикому её не передавай.",
+        f"🌐 <b>Твоя персональная ссылка</b>\n\n<a href=\"{_esc(url)}\">Открыть веб-панель</a>\n\n"
+        f"<code>{_esc(url)}</code>\n\nНикому её не передавай.",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -856,7 +910,8 @@ async def _send_web_link(target, user_id: int):
     token = issue_web_token(user_id)
     url = f"{public_url.rstrip('/')}/?token={token}"
     await target.reply_text(
-        f"🌐 <b>Персональная ссылка</b>\n\n{url}\n\nНикому её не передавай.",
+        f"🌐 <b>Персональная ссылка</b>\n\n<a href=\"{_esc(url)}\">Открыть веб-панель</a>\n\n"
+        f"<code>{_esc(url)}</code>\n\nНикому её не передавай.",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -866,16 +921,26 @@ async def _send_web_link(target, user_id: int):
 #  HELPERS
 # ═══════════════════════════════════════════════════════
 
-async def _get_kickoff_for_alert(sport, match_id):
+async def _get_match_meta(sport, match_id):
     if sport == "football":
         ev = await api.football_event(match_id)
-        if ev and api.is_not_started(ev):
-            return api.get_kickoff_timestamp(ev)
     elif sport == "basketball":
         ev = await api.basketball_event(match_id)
-        if ev and api.is_not_started(ev):
-            return api.get_kickoff_timestamp(ev)
-    return 0
+    else:
+        ev = None
+
+    if not ev:
+        return {"event": None, "kickoff_at": 0, "match_label": f"Match #{match_id}"}
+
+    return {
+        "event": ev,
+        "kickoff_at": api.get_kickoff_timestamp(ev) if api.is_not_started(ev) else 0,
+        "match_label": api.get_match_label(ev),
+    }
+
+
+async def _get_kickoff_for_alert(sport, match_id):
+    return (await _get_match_meta(sport, match_id))["kickoff_at"]
 
 
 async def _get_match_label(sport, match_id):
@@ -1078,8 +1143,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     team = parts[2].lower() if len(parts) >= 3 and parts[2].lower() in ("home", "away") else "total"
     sport, match_id = pending["sport"], pending["fixture_id"]
-    kickoff_at = await _get_kickoff_for_alert(sport, match_id)
-    match_label = await _get_match_label(sport, match_id)
+    match_meta = await _get_match_meta(sport, match_id)
+    kickoff_at = match_meta["kickoff_at"]
+    match_label = match_meta["match_label"]
     alert_id = await db.add_alert(
         user_id=update.effective_user.id, chat_id=update.effective_chat.id,
         fixture_id=match_id, stat_key=pending["stat_key"], operator=oper,
@@ -1128,8 +1194,9 @@ async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     team = args[5].lower() if len(args) >= 6 and args[5].lower() in ("home", "away") else "total"
-    kickoff_at = await _get_kickoff_for_alert(sport, fixture_id)
-    match_label = await _get_match_label(sport, fixture_id)
+    match_meta = await _get_match_meta(sport, fixture_id)
+    kickoff_at = match_meta["kickoff_at"]
+    match_label = match_meta["match_label"]
     alert_id = await db.add_alert(
         user_id=update.effective_user.id, chat_id=update.effective_chat.id,
         fixture_id=fixture_id, stat_key=stat_key, operator=oper,
@@ -1160,6 +1227,12 @@ async def _send_html_message(bot, chat_id: int, text: str):
     try:
         await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
     except Exception as e:
+        if "Can't parse entities" in str(e):
+            try:
+                await bot.send_message(chat_id=chat_id, text=_plain_from_html(text))
+                return
+            except Exception:
+                pass
         logger.error("Send failed to %s: %s", chat_id, e)
 
 
@@ -1372,7 +1445,7 @@ async def check_overdue_matches(context: ContextTypes.DEFAULT_TYPE):
             if canceled_matches:
                 lines.append(f"❌ <b>Отменено/перенесено ({len(canceled_matches)}):</b>")
                 for m in canceled_matches[:10]:
-                    lines.append(f"  • {m}")
+                    lines.append(f"  • {_esc(m)}")
                 if len(canceled_matches) > 10:
                     lines.append(f"  ... и ещё {len(canceled_matches) - 10}")
                 lines.append("Алерты деактивированы.")
@@ -1381,7 +1454,7 @@ async def check_overdue_matches(context: ContextTypes.DEFAULT_TYPE):
             if overdue_matches:
                 lines.append(f"⚠️ <b>Задерживаются ({len(overdue_matches)}):</b>")
                 for m in overdue_matches[:10]:
-                    lines.append(f"  • {m}")
+                    lines.append(f"  • {_esc(m)}")
                 if len(overdue_matches) > 10:
                     lines.append(f"  ... и ещё {len(overdue_matches) - 10}")
                 lines.append("Алерты пока активны, жду начала.")
@@ -1422,6 +1495,7 @@ async def post_init(app: Application):
 async def _shutdown_core():
     global _web_runner
     await api.close_session()
+    await db.close_db()
     await stop_web_app(_web_runner)
     _web_runner = None
 
