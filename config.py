@@ -18,7 +18,7 @@ APP_NAME = os.getenv("APP_NAME", "Pulse Alerts").strip() or "Pulse Alerts"
 # ─── SofaScore API ──────────────────────────────────────
 SOFASCORE_BASE = "https://www.sofascore.com/api/v1"
 # Rate limiting: min seconds between SofaScore requests
-SOFASCORE_MIN_INTERVAL = float(os.getenv("SOFASCORE_MIN_INTERVAL", "0.35"))
+SOFASCORE_MIN_INTERVAL = float(os.getenv("SOFASCORE_MIN_INTERVAL", "0.50"))
 
 # ─── Polling ────────────────────────────────────────────
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", "15"))

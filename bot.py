@@ -621,7 +621,7 @@ async def _handle_bulk_alert(query, sport, date_str, stat_key):
 
     targets = [e for e in events if api.is_not_started(e) or api.is_live(e)]
     if not targets:
-        await query.edit_message_text("Нет доступных матчей для алертов.")
+        await _safe_edit(query, "Нет доступных матчей для алертов.")
         return
 
     matches = []
@@ -644,11 +644,12 @@ async def _handle_bulk_alert(query, sport, date_str, stat_key):
         return
 
     stat_label = (FOOTBALL_STATS if sport == "football" else BASKETBALL_STATS).get(stat_key, {}).get("label", stat_key)
-    await query.edit_message_text(
+    await _safe_edit(
+        query,
         f"✅ <b>Создано {len(ids)} алертов!</b>\n\n"
         f"📊 {stat_label} на все матчи {date_str}\n"
         f"🆔 #{ids[0]}—#{ids[-1]}",
-        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+        InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Мои алерты", callback_data="myalerts")],
             [InlineKeyboardButton("🏠 Главная", callback_data="main_menu")]]))
 
@@ -661,7 +662,7 @@ async def _handle_bulk_live(query, sport, stat_key):
         events = await api.basketball_live()
 
     if not events:
-        await query.edit_message_text("Нет live-матчей.")
+        await _safe_edit(query, "Нет live-матчей.")
         return
 
     matches = []
@@ -678,11 +679,12 @@ async def _handle_bulk_live(query, sport, stat_key):
         stat_key=stat_key, operator="==", threshold=1)
 
     stat_label = (FOOTBALL_STATS if sport == "football" else BASKETBALL_STATS).get(stat_key, {}).get("label", stat_key)
-    await query.edit_message_text(
+    await _safe_edit(
+        query,
         f"✅ <b>Создано {len(ids)} алертов!</b>\n\n"
         f"📊 {stat_label} на все live-матчи\n"
         f"🆔 #{ids[0]}—#{ids[-1]}",
-        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([
+        InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 Мои алерты", callback_data="myalerts")],
             [InlineKeyboardButton("🏠 Главная", callback_data="main_menu")]]))
 
@@ -1106,6 +1108,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if "Timed out" in err_str:
             logger.warning("Callback timeout [%s]", data)
+            return
+        if "NetworkError" in err_str or "wrong version number" in err_str or "ConnectError" in err_str:
+            logger.warning("Callback network error [%s]: %s", data, e)
+            try:
+                await query.answer("Сеть Telegram сейчас нестабильна, попробуй ещё раз.", show_alert=True)
+            except Exception:
+                pass
             return
         logger.error("Callback error [%s]: %s", data, e, exc_info=True)
         try:
