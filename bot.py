@@ -209,8 +209,7 @@ async def _show_day(query, sport: str, day_offset: int):
     day_name = DAY_NAMES.get(target_date.weekday(), "")
     date_display = target_date.strftime("%d.%m.%Y")
 
-    await query.edit_message_text(f"🔍 Загружаю матчи на {date_display}...")
-
+    # Skip "loading" message on slow networks — it doubles latency
     if sport == "football":
         events = await api.football_by_date(date_str)
     else:
@@ -323,8 +322,6 @@ def _add_match_btn(buttons, ev, sport):
 # ═══════════════════════════════════════════════════════
 
 async def _show_live(query, sport: str):
-    await query.edit_message_text("🔍 Загружаю live...")
-
     if sport == "football":
         events = await api.football_live()
     else:
