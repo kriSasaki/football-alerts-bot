@@ -119,69 +119,98 @@ async def _get(endpoint: str, params: dict | None = None) -> dict | list | None:
         return await _get_aiohttp(url, params)
 
 
+# FlareSolverr session cookies (obtained after passing Cloudflare challenge)
+_flaresolverr_cookies: dict = {}
+_flaresolverr_ua: str = ""
+_flaresolverr_cookies_time: float = 0
+_COOKIE_TTL = 1800  # refresh cookies every 30 min
+
+
+async def _ensure_flaresolverr_cookies():
+    """Visit sofascore.com main page via FlareSolverr to get Cloudflare cookies."""
+    global _flaresolverr_cookies, _flaresolverr_ua, _flaresolverr_cookies_time
+
+    if _flaresolverr_cookies and (time.time() - _flaresolverr_cookies_time < _COOKIE_TTL):
+        return  # cookies still fresh
+
+    logger.info("FlareSolverr: obtaining Cloudflare cookies...")
+    payload = json.dumps({
+        "cmd": "request.get",
+        "url": "https://www.sofascore.com/",
+        "maxTimeout": 60000,
+    })
+
+    try:
+        from curl_cffi.requests import AsyncSession
+        async with AsyncSession() as session:
+            resp = await session.post(
+                _FLARESOLVERR_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=65,
+            )
+            wrapper = json.loads(resp.content)
+
+        if wrapper.get("status") != "ok":
+            logger.error("FlareSolverr cookie fetch failed: %s", wrapper.get("message"))
+            return
+
+        solution = wrapper.get("solution", {})
+        cookies_list = solution.get("cookies", [])
+        _flaresolverr_ua = solution.get("userAgent", "")
+        _flaresolverr_cookies = {c["name"]: c["value"] for c in cookies_list if "name" in c and "value" in c}
+        _flaresolverr_cookies_time = time.time()
+        logger.info("FlareSolverr: got %d cookies, UA: %s", len(_flaresolverr_cookies), _flaresolverr_ua[:50])
+
+    except Exception as e:
+        logger.error("FlareSolverr cookie error: %s", e)
+
+
 async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list | None:
-    """Make request via FlareSolverr (headless Chrome, bypasses Cloudflare).
-    Uses curl_cffi to POST to FlareSolverr, which is always available."""
+    """Use FlareSolverr cookies with curl_cffi to make direct API requests.
+    Strategy: FlareSolverr visits sofascore.com to get cf_clearance cookie,
+    then we use that cookie with curl_cffi for fast API requests."""
+    await _ensure_flaresolverr_cookies()
+
+    if not _flaresolverr_cookies:
+        logger.warning("No FlareSolverr cookies available, skipping")
+        return None
+
     full_url = url
     if params:
         from urllib.parse import urlencode
         full_url = f"{url}?{urlencode(params)}"
 
-    payload = json.dumps({
-        "cmd": "request.get",
-        "url": full_url,
-        "maxTimeout": 30000,
-    })
+    headers = {
+        **_HEADERS,
+        "User-Agent": _flaresolverr_ua,
+    }
+    cookie_str = "; ".join(f"{k}={v}" for k, v in _flaresolverr_cookies.items())
+    headers["Cookie"] = cookie_str
 
-    resp_text = ""
     try:
-        if _USE_CURL_CFFI:
-            from curl_cffi.requests import AsyncSession
-            async with AsyncSession() as session:
-                resp = await session.post(
-                    _FLARESOLVERR_URL,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    timeout=35,
-                )
-                resp_bytes = resp.content
-        else:
-            import urllib.request
-            req = urllib.request.Request(
-                _FLARESOLVERR_URL,
-                data=payload.encode(),
-                headers={"Content-Type": "application/json"},
-            )
-            loop = asyncio.get_event_loop()
-            resp_bytes = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=35).read())
+        from curl_cffi.requests import AsyncSession
+        async with AsyncSession(impersonate="chrome124", verify=False) as session:
+            resp = await session.get(full_url, headers=headers, timeout=20)
 
-        # Parse FlareSolverr wrapper JSON
-        wrapper = json.loads(resp_bytes)
+            if resp.status_code == 403:
+                # Cookies expired, force refresh
+                logger.info("FlareSolverr cookies expired, refreshing...")
+                global _flaresolverr_cookies_time
+                _flaresolverr_cookies_time = 0
+                await _ensure_flaresolverr_cookies()
+                if not _flaresolverr_cookies:
+                    return None
+                headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in _flaresolverr_cookies.items())
+                headers["User-Agent"] = _flaresolverr_ua
+                resp = await session.get(full_url, headers=headers, timeout=20)
 
-        if wrapper.get("status") != "ok":
-            logger.warning("FlareSolverr error: %s", wrapper.get("message", "unknown"))
-            return None
+            if resp.status_code != 200:
+                logger.warning("FlareSolverr+cookies got HTTP %s for %s", resp.status_code, full_url)
+                return None
 
-        solution = wrapper.get("solution", {})
-        http_status = solution.get("status", 0)
-        if http_status != 200:
-            logger.warning("FlareSolverr got HTTP %s for %s", http_status, full_url)
-            return None
+            return resp.json()
 
-        # solution.response is the actual page body (JSON string from SofaScore)
-        body = solution.get("response", "")
-        if not body:
-            logger.warning("FlareSolverr empty response body for %s", full_url)
-            return None
-
-        # SofaScore returns JSON — parse it
-        result = json.loads(body)
-        logger.debug("FlareSolverr OK: %s", full_url)
-        return result
-
-    except json.JSONDecodeError as e:
-        logger.error("FlareSolverr JSON parse error: %s (url: %s)", e, full_url)
-        return None
     except Exception as e:
         logger.error("FlareSolverr request error: %s (url: %s)", e, full_url)
         return None
