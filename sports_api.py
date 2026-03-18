@@ -38,21 +38,31 @@ _rate_lock = asyncio.Lock()
 _curl_session: "CurlAsyncSession | None" = None
 
 
+import os
+
+# Proxy support: set SOFASCORE_PROXY in .env if SofaScore blocks datacenter IPs
+_PROXY = os.getenv("SOFASCORE_PROXY", "").strip() or None
+if _PROXY:
+    logger.info("Using proxy for SofaScore: %s", _PROXY.split("@")[-1] if "@" in _PROXY else _PROXY)
+
+# Flaresolverr support: run Cloudflare-bypassing headless Chrome
+# docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+_FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "").strip() or None
+if _FLARESOLVERR_URL:
+    logger.info("Using Flaresolverr at %s", _FLARESOLVERR_URL)
+
+
 async def _get_curl_session():
     global _curl_session
     if _curl_session is None and _USE_CURL_CFFI:
-        _curl_session = CurlAsyncSession(
-            impersonate="chrome124",
-            verify=False,
-            timeout=20,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            },
-        )
+        kwargs = {
+            "impersonate": "chrome124",
+            "verify": False,
+            "timeout": 20,
+        }
+        if _PROXY:
+            kwargs["proxy"] = _PROXY
+        _curl_session = CurlAsyncSession(**kwargs)
     return _curl_session
 
 
@@ -96,10 +106,79 @@ async def _get(endpoint: str, params: dict | None = None) -> dict | list | None:
     await _rate_wait()
     url = f"{SOFASCORE_BASE}/{endpoint}"
 
+    # Try Flaresolverr first if configured
+    if _FLARESOLVERR_URL:
+        result = await _get_flaresolverr(url, params)
+        if result is not None:
+            return result
+        # Fall through to direct request
+
     if _USE_CURL_CFFI:
         return await _get_curl(url, params)
     else:
         return await _get_aiohttp(url, params)
+
+
+async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list | None:
+    """Make request via Flaresolverr (headless Chrome, bypasses Cloudflare)."""
+    try:
+        import aiohttp as _aiohttp
+    except ImportError:
+        # Use synchronous request as fallback
+        import urllib.request
+        import json as _json
+        full_url = url
+        if params:
+            from urllib.parse import urlencode
+            full_url = f"{url}?{urlencode(params)}"
+        payload = _json.dumps({
+            "cmd": "request.get",
+            "url": full_url,
+            "maxTimeout": 15000,
+        }).encode()
+        req = urllib.request.Request(
+            _FLARESOLVERR_URL,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = _json.loads(resp.read())
+                if data.get("status") == "ok":
+                    body = data.get("solution", {}).get("response", "")
+                    return _json.loads(body)
+        except Exception as e:
+            logger.error("Flaresolverr sync error: %s", e)
+            return None
+
+    full_url = url
+    if params:
+        from urllib.parse import urlencode
+        full_url = f"{url}?{urlencode(params)}"
+
+    payload = {
+        "cmd": "request.get",
+        "url": full_url,
+        "maxTimeout": 15000,
+    }
+    try:
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(
+                _FLARESOLVERR_URL,
+                json=payload,
+                timeout=_aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                data = await resp.json()
+                if data.get("status") == "ok":
+                    body = data.get("solution", {}).get("response", "")
+                    import json as _json
+                    return _json.loads(body)
+                else:
+                    logger.warning("Flaresolverr error: %s", data.get("message", "unknown"))
+                    return None
+    except Exception as e:
+        logger.error("Flaresolverr request error: %s", e)
+        return None
 
 
 async def _get_curl(url: str, params: dict | None = None) -> dict | list | None:
