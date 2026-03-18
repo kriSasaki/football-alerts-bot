@@ -42,9 +42,16 @@ async def _get_curl_session():
     global _curl_session
     if _curl_session is None and _USE_CURL_CFFI:
         _curl_session = CurlAsyncSession(
-            impersonate="chrome",
+            impersonate="chrome124",
             verify=False,
             timeout=20,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            },
         )
     return _curl_session
 
@@ -59,10 +66,17 @@ async def close_session():
 
 _HEADERS = {
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.sofascore.com/",
     "Origin": "https://www.sofascore.com",
     "Cache-Control": "no-cache",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
 }
 
 
@@ -95,17 +109,27 @@ async def _get_curl(url: str, params: dict | None = None) -> dict | list | None:
         resp = await session.get(url, params=params, headers=_HEADERS)
 
         if resp.status_code == 403:
-            logger.warning("SofaScore 403 (Cloudflare) on %s — retrying in 5s...", url)
-            # Close and recreate session on 403 (cookie/fingerprint may be stale)
+            logger.warning("SofaScore 403 (Cloudflare) on %s — retrying with new session...", url)
             global _curl_session
             try:
                 await _curl_session.close()
             except:
                 pass
             _curl_session = None
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
+
+            # Retry 1: fresh session
             session = await _get_curl_session()
             resp = await session.get(url, params=params, headers=_HEADERS)
+
+            if resp.status_code == 403:
+                # Retry 2: try api.sofascore.com subdomain
+                alt_url = url.replace("www.sofascore.com/api/v1", "api.sofascore.com/api/v1")
+                if alt_url != url:
+                    logger.info("Trying alt endpoint: %s", alt_url)
+                    alt_headers = {**_HEADERS, "Referer": "https://www.sofascore.com/", "Origin": "https://www.sofascore.com"}
+                    resp = await session.get(alt_url, params=params, headers=alt_headers)
+
             if resp.status_code == 403:
                 logger.error("SofaScore 403 persistent on %s", url)
                 return None
