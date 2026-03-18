@@ -167,50 +167,68 @@ async def _ensure_flaresolverr_cookies():
 
 
 async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list | None:
-    """Use FlareSolverr cookies with curl_cffi to make direct API requests.
-    Strategy: FlareSolverr visits sofascore.com to get cf_clearance cookie,
-    then we use that cookie with curl_cffi for fast API requests."""
-    await _ensure_flaresolverr_cookies()
-
-    if not _flaresolverr_cookies:
-        logger.warning("No FlareSolverr cookies available, skipping")
-        return None
-
+    """Route every request through FlareSolverr headless Chrome.
+    Slower (~5s per request) but reliable against Cloudflare."""
     full_url = url
     if params:
         from urllib.parse import urlencode
         full_url = f"{url}?{urlencode(params)}"
 
-    headers = {
-        **_HEADERS,
-        "User-Agent": _flaresolverr_ua,
-    }
-    cookie_str = "; ".join(f"{k}={v}" for k, v in _flaresolverr_cookies.items())
-    headers["Cookie"] = cookie_str
+    payload = json.dumps({
+        "cmd": "request.get",
+        "url": full_url,
+        "maxTimeout": 30000,
+    })
 
     try:
         from curl_cffi.requests import AsyncSession
-        async with AsyncSession(impersonate="chrome124", verify=False) as session:
-            resp = await session.get(full_url, headers=headers, timeout=20)
+        async with AsyncSession() as session:
+            resp = await session.post(
+                _FLARESOLVERR_URL,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=35,
+            )
+            wrapper = json.loads(resp.content)
 
-            if resp.status_code == 403:
-                # Cookies expired, force refresh
-                logger.info("FlareSolverr cookies expired, refreshing...")
-                global _flaresolverr_cookies_time
-                _flaresolverr_cookies_time = 0
-                await _ensure_flaresolverr_cookies()
-                if not _flaresolverr_cookies:
-                    return None
-                headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in _flaresolverr_cookies.items())
-                headers["User-Agent"] = _flaresolverr_ua
-                resp = await session.get(full_url, headers=headers, timeout=20)
+        if wrapper.get("status") != "ok":
+            logger.warning("FlareSolverr error: %s", wrapper.get("message", "unknown"))
+            return None
 
-            if resp.status_code != 200:
-                logger.warning("FlareSolverr+cookies got HTTP %s for %s", resp.status_code, full_url)
-                return None
+        solution = wrapper.get("solution", {})
+        body = solution.get("response", "")
+        if not body:
+            logger.warning("FlareSolverr empty body for %s", full_url)
+            return None
 
-            return resp.json()
+        # FlareSolverr wraps JSON in HTML <pre> tags — extract it
+        if body.strip().startswith("<"):
+            import re
+            # Extract content between <pre> tags
+            m = re.search(r"<pre[^>]*>(.*?)</pre>", body, re.DOTALL)
+            if m:
+                body = m.group(1).strip()
+            else:
+                # Try stripping all HTML tags
+                body = re.sub(r"<[^>]+>", "", body).strip()
 
+        if not body or body.startswith("<"):
+            logger.warning("FlareSolverr returned HTML, not JSON for %s", full_url)
+            return None
+
+        data = json.loads(body)
+
+        # Check if SofaScore returned an error inside JSON
+        if isinstance(data, dict) and "error" in data:
+            err = data["error"]
+            logger.warning("SofaScore API error via FlareSolverr: %s (url: %s)", err, full_url)
+            return None
+
+        return data
+
+    except json.JSONDecodeError as e:
+        logger.error("FlareSolverr JSON parse error: %s (url: %s)", e, full_url)
+        return None
     except Exception as e:
         logger.error("FlareSolverr request error: %s (url: %s)", e, full_url)
         return None
