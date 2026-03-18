@@ -120,64 +120,59 @@ async def _get(endpoint: str, params: dict | None = None) -> dict | list | None:
 
 
 async def _get_flaresolverr(url: str, params: dict | None = None) -> dict | list | None:
-    """Make request via Flaresolverr (headless Chrome, bypasses Cloudflare)."""
-    try:
-        import aiohttp as _aiohttp
-    except ImportError:
-        # Use synchronous request as fallback
-        import urllib.request
-        import json as _json
-        full_url = url
-        if params:
-            from urllib.parse import urlencode
-            full_url = f"{url}?{urlencode(params)}"
-        payload = _json.dumps({
-            "cmd": "request.get",
-            "url": full_url,
-            "maxTimeout": 15000,
-        }).encode()
-        req = urllib.request.Request(
-            _FLARESOLVERR_URL,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = _json.loads(resp.read())
-                if data.get("status") == "ok":
-                    body = data.get("solution", {}).get("response", "")
-                    return _json.loads(body)
-        except Exception as e:
-            logger.error("Flaresolverr sync error: %s", e)
-            return None
-
+    """Make request via FlareSolverr (headless Chrome, bypasses Cloudflare).
+    Uses curl_cffi to POST to FlareSolverr, which is always available."""
     full_url = url
     if params:
         from urllib.parse import urlencode
         full_url = f"{url}?{urlencode(params)}"
 
-    payload = {
+    payload = json.dumps({
         "cmd": "request.get",
         "url": full_url,
-        "maxTimeout": 15000,
-    }
+        "maxTimeout": 30000,
+    })
+
     try:
-        async with _aiohttp.ClientSession() as session:
-            async with session.post(
+        if _USE_CURL_CFFI:
+            from curl_cffi.requests import AsyncSession
+            async with AsyncSession() as session:
+                resp = await session.post(
+                    _FLARESOLVERR_URL,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=35,
+                )
+                data = resp.json()
+        else:
+            # Fallback: synchronous urllib (runs in thread)
+            import urllib.request
+            req = urllib.request.Request(
                 _FLARESOLVERR_URL,
-                json=payload,
-                timeout=_aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                data = await resp.json()
-                if data.get("status") == "ok":
-                    body = data.get("solution", {}).get("response", "")
-                    import json as _json
-                    return _json.loads(body)
-                else:
-                    logger.warning("Flaresolverr error: %s", data.get("message", "unknown"))
-                    return None
+                data=payload.encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            loop = asyncio.get_event_loop()
+            resp_data = await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=35).read())
+            data = json.loads(resp_data)
+
+        if data.get("status") != "ok":
+            logger.warning("FlareSolverr error: %s", data.get("message", "unknown"))
+            return None
+
+        # FlareSolverr returns the page body as a string in solution.response
+        body = data.get("solution", {}).get("response", "")
+        if not body:
+            logger.warning("FlareSolverr empty response for %s", full_url)
+            return None
+
+        return json.loads(body)
+
+    except json.JSONDecodeError as e:
+        logger.error("FlareSolverr JSON parse error: %s (url: %s)", e, full_url)
+        return None
     except Exception as e:
-        logger.error("Flaresolverr request error: %s", e)
+        logger.error("FlareSolverr request error: %s (url: %s)", e, full_url)
         return None
 
 
