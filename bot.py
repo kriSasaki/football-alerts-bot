@@ -1336,6 +1336,13 @@ def main():
         print("❌ Set TELEGRAM_BOT_TOKEN in .env!")
         return
 
+    # Python 3.14 no longer creates an implicit current event loop.
+    # python-telegram-bot still expects one before run_polling() boots.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -1383,9 +1390,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
     main()
