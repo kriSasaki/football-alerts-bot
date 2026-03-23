@@ -319,6 +319,93 @@ def format_alert_summary(alert: dict) -> str:
     return f"{sport_emoji} #{alert['id']} | {stat_display}{team_str} {alert['operator']} {alert['threshold']}"
 
 
+# ─── Проверка невозможности срабатывания ────────────────
+
+def alert_is_impossible(alert: dict, parsed_scores: dict) -> bool:
+    """
+    Возвращает True если условие алерта уже точно не пройдёт:
+    - четверть завершилась с нечётным тоталом (для even-алертов)
+    - четверть завершилась, но тотал не достигнет порога (N < threshold при операторе >)
+    - матч завершён
+    """
+    sport = alert.get("sport", "basketball")
+    stat_key = alert["stat_key"]
+    operator = alert["operator"]
+    threshold = alert["threshold"]
+
+    if sport != "basketball":
+        # Для футбола: матч завершён — больше угловых/ударов не будет
+        status = parsed_scores.get("status_type", "")
+        if status == "finished":
+            return True
+        return False
+
+    status = parsed_scores.get("status_type", "")
+
+    # Если матч завершён и алерт ещё активен — он не сработал, невозможно
+    if status == "finished":
+        return True
+
+    def _period_impossible_even(finished_key: str, even_key: str) -> bool:
+        """Четверть завершилась и тотал нечётный — even-алерт невозможен."""
+        if not parsed_scores.get(finished_key):
+            return False  # ещё не завершилась — ещё возможно
+        return parsed_scores.get(even_key) is False  # False = нечётный
+
+    def _period_impossible_threshold(finished_key: str, total_key: str) -> bool:
+        """Четверть завершилась и тотал не достигнет порога."""
+        if not parsed_scores.get(finished_key):
+            return False
+        value = parsed_scores.get(total_key)
+        if value is None:
+            return False
+        # Невозможно если: значение < порог при операторе > или >=
+        if operator in (">", ">=") and value <= threshold:
+            return True
+        # значение > порог при операторе < или <=
+        if operator in ("<", "<=") and value >= threshold:
+            return True
+        return False
+
+    # q1_even: Q1 завершилась нечётно
+    if stat_key == "q1_even":
+        return _period_impossible_even("q1_finished", "q1_even")
+
+    # q2_even: Q2 завершилась нечётно
+    if stat_key == "q2_even":
+        return _period_impossible_even("q2_finished", "q2_even")
+
+    # q1q2_even: Q1 завершилась нечётно (даже если Q2 ещё идёт)
+    if stat_key == "q1q2_even":
+        if parsed_scores.get("q1_finished") and parsed_scores.get("q1_even") is False:
+            return True  # Q1 нечётный — q1q2_even уже невозможен
+        if parsed_scores.get("q2_finished") and parsed_scores.get("q2_even") is False:
+            return True  # Q2 нечётный
+        return False
+
+    # q1_total, q2_total, q3_total, q4_total, half1
+    period_map = {
+        "q1_total": ("q1_finished", "q1_total"),
+        "q2_total": ("q2_finished", "q2_total"),
+        "q3_total": ("q3_finished", "q3_total"),
+        "q4_total": ("q4_finished", "q4_total"),
+        "half1":    ("half1_finished", "half1_total"),
+    }
+    if stat_key in period_map:
+        fk, tk = period_map[stat_key]
+        return _period_impossible_threshold(fk, tk)
+
+    # points (тотал матча): если матч завершён
+    if stat_key == "points" and status == "finished":
+        value = parsed_scores.get("points", 0)
+        if operator in (">", ">=") and (value or 0) <= threshold:
+            return True
+        if operator in ("<", "<=") and (value or 0) >= threshold:
+            return True
+
+    return False
+
+
 def _to_num(value) -> float | None:
     if value is None:
         return None

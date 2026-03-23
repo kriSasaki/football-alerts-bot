@@ -96,9 +96,37 @@ async def init_db():
             updated_at  REAL    NOT NULL
         )
     """)
+    # Авто-охота: правила без привязки к матчу
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS hunt_rules (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            chat_id     INTEGER NOT NULL,
+            sport       TEXT    NOT NULL DEFAULT 'basketball',
+            source      TEXT    NOT NULL DEFAULT 'fonbet',
+            stat_key    TEXT    NOT NULL,
+            operator    TEXT    NOT NULL,
+            threshold   REAL    NOT NULL,
+            active      INTEGER DEFAULT 1,
+            created_at  REAL    NOT NULL,
+            triggered_count INTEGER DEFAULT 0,
+            last_triggered_at REAL DEFAULT 0
+        )
+    """)
+    # Матчи, по которым уже сработала авто-охота (чтобы не повторять)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS hunt_seen_fixtures (
+            rule_id     INTEGER NOT NULL,
+            fixture_id  INTEGER NOT NULL,
+            result      TEXT    NOT NULL DEFAULT 'pending',
+            created_at  REAL    NOT NULL,
+            PRIMARY KEY (rule_id, fixture_id)
+        )
+    """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active, fixture_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON alerts(user_id, active)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_web_push_user ON web_push_subscriptions(user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_hunt_rules_user ON hunt_rules(user_id, active)")
     # Миграции для существующих БД
     for sql in [
         "ALTER TABLE alerts ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
@@ -352,6 +380,111 @@ async def count_user_active_alerts(user_id: int) -> int:
         (user_id,),
     )
     return rows[0]["cnt"] if rows else 0
+
+
+# ─── Hunt Rules (Авто-охота) ─────────────────────────
+
+async def add_hunt_rule(
+    user_id: int, chat_id: int, sport: str, source: str,
+    stat_key: str, operator: str, threshold: float,
+) -> int:
+    db = await _get_db()
+    cursor = await db.execute(
+        """INSERT INTO hunt_rules
+           (user_id, chat_id, sport, source, stat_key, operator, threshold, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, chat_id, sport, source, stat_key, operator, threshold, time.time()),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def get_user_hunt_rules(user_id: int) -> list[dict]:
+    db = await _get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM hunt_rules WHERE user_id = ? AND active = 1 ORDER BY id DESC",
+        (user_id,),
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_all_active_hunt_rules() -> list[dict]:
+    db = await _get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM hunt_rules WHERE active = 1 ORDER BY id"
+    )
+    return [dict(r) for r in rows]
+
+
+async def deactivate_hunt_rule(rule_id: int, user_id: int) -> bool:
+    db = await _get_db()
+    cursor = await db.execute(
+        "UPDATE hunt_rules SET active=0 WHERE id=? AND user_id=?",
+        (rule_id, user_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def clear_all_user_hunt_rules(user_id: int) -> int:
+    db = await _get_db()
+    cursor = await db.execute(
+        "UPDATE hunt_rules SET active=0 WHERE user_id=? AND active=1",
+        (user_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def count_user_active_hunt_rules(user_id: int) -> int:
+    db = await _get_db()
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) AS cnt FROM hunt_rules WHERE user_id = ? AND active = 1",
+        (user_id,),
+    )
+    return rows[0]["cnt"] if rows else 0
+
+
+async def hunt_fixture_seen(rule_id: int, fixture_id: int) -> bool:
+    """Проверяет, был ли уже обработан этот матч для данного правила."""
+    db = await _get_db()
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM hunt_seen_fixtures WHERE rule_id=? AND fixture_id=?",
+        (rule_id, fixture_id),
+    )
+    return len(rows) > 0
+
+
+async def hunt_mark_fixture(rule_id: int, fixture_id: int, result: str = "done"):
+    """Отмечает матч как обработанный (triggered/skipped/expired)."""
+    db = await _get_db()
+    try:
+        await db.execute(
+            "INSERT INTO hunt_seen_fixtures (rule_id, fixture_id, result, created_at) VALUES (?,?,?,?)",
+            (rule_id, fixture_id, result, time.time()),
+        )
+    except Exception:
+        # уже есть — обновляем
+        await db.execute(
+            "UPDATE hunt_seen_fixtures SET result=? WHERE rule_id=? AND fixture_id=?",
+            (result, rule_id, fixture_id),
+        )
+    if result == "triggered":
+        await db.execute(
+            "UPDATE hunt_rules SET triggered_count=triggered_count+1, last_triggered_at=? WHERE id=?",
+            (time.time(), rule_id),
+        )
+    await db.commit()
+
+
+async def hunt_cleanup_seen(max_age_hours: int = 48):
+    """Удаляет старые записи из hunt_seen_fixtures."""
+    cutoff = time.time() - max_age_hours * 3600
+    db = await _get_db()
+    await db.execute(
+        "DELETE FROM hunt_seen_fixtures WHERE created_at < ?", (cutoff,)
+    )
+    await db.commit()
 
 
 # ─── Web Push ──────────────────────────────────────────

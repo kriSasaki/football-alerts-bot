@@ -50,6 +50,7 @@ from alert_engine import (
     check_football_alert, check_basketball_alert,
     format_football_notification, format_basketball_notification,
     format_alert_summary, format_live_alert_status,
+    alert_is_impossible,
 )
 
 # ═══════════════════════════════════════════════════════
@@ -203,6 +204,9 @@ async def _show_main_menu(target, edit=False, user_id=None):
     ]
     alert_label = f"📋 Мои алерты ({alert_count})" if alert_count else "📋 Мои алерты"
     buttons.append([InlineKeyboardButton(alert_label, callback_data="myalerts:0")])
+    hunt_count = await db.count_user_active_hunt_rules(user_id) if user_id else 0
+    hunt_label = f"🎯 Авто-охота ({hunt_count} акт.)" if hunt_count else "🎯 Авто-охота"
+    buttons.append([InlineKeyboardButton(hunt_label, callback_data="hunt_menu")])
     buttons.append([InlineKeyboardButton("🌐 Веб-панель", callback_data="web_link")])
 
     # Кнопка выбора источника
@@ -1116,6 +1120,205 @@ async def _show_help(query):
 
 
 # ═══════════════════════════════════════════════════════
+#  АВТО-ОХОТА (HUNT MODE)
+# ═══════════════════════════════════════════════════════
+
+async def _show_hunt_menu(query, user_id: int):
+    """^Главное меню Авто-охоты."""
+    rules = await db.get_user_hunt_rules(user_id)
+    count = len(rules)
+
+    lines = [
+        "🎯 <b>Авто-охота</b>",
+        "",
+        "Бот сам проверяет <b>все</b> новые live-матчи по заданному условию.",
+        "Как только условие срабатывает — приходит уведомление. Если нет — матч пропускается.",
+        "Не нужно выбирать конкретные матчи — бот сам отследит всё.",
+    ]
+
+    if rules:
+        lines.append(f"")
+        lines.append(f"🟢 <b>Активных правил: {count}</b>")
+        for r in rules:
+            src_emoji = "🎰" if r["source"] == "fonbet" else "📊"
+            sport_emoji = SPORTS.get(r["sport"], {}).get("emoji", "")
+            stat_info = BASKETBALL_STATS.get(r["stat_key"], FOOTBALL_STATS.get(r["stat_key"], {}))
+            stat_label = stat_info.get("label", r["stat_key"])
+            lines.append(
+                f"  {src_emoji}{sport_emoji} #{r['id']} | {_esc(stat_label)} "
+                f"{r['operator']} {r['threshold']} — сработал: {r['triggered_count']}×"
+            )
+
+    text = "\n".join(lines)
+
+    buttons = [
+        [InlineKeyboardButton("🎰 Настроить условие", callback_data="hunt_new")],
+    ]
+    if rules:
+        buttons.append([InlineKeyboardButton(
+            f"❌ Отключить все ({count})", callback_data="hunt_stop_all"
+        )])
+        for r in rules:
+            src_emoji = "🎰" if r["source"] == "fonbet" else "📊"
+            buttons.append([InlineKeyboardButton(
+                f"{src_emoji} Остановить #{r['id']}",
+                callback_data=f"hunt_stop:{r['id']}"
+            )])
+    buttons.append([InlineKeyboardButton("« Главная", callback_data="main_menu")])
+    await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def _show_hunt_new(query):
+    """^Выбор спорта и источника для нового правила."""
+    user_id = query.from_user.id
+    settings = await db.get_user_settings(user_id)
+    source = settings.get("data_source", SOURCE_FONBET)
+    if source == SOURCE_BOTH:
+        source = SOURCE_FONBET  # по умолчанию для охоты берём Fonbet
+
+    text = (
+        "🎯 <b>Авто-охота — выбор спорта</b>\n\n"
+        "Выбери спорт и источник данных:"
+    )
+    buttons = [
+        [InlineKeyboardButton("🎰🏀 Баскетбол (Fonbet)",   callback_data="hunt_setup:basketball:fonbet")],
+        [InlineKeyboardButton("📊🏀 Баскетбол (SofaScore)", callback_data="hunt_setup:basketball:sofascore")],
+        [InlineKeyboardButton("🎰⚽ Футбол (Fonbet)",     callback_data="hunt_setup:football:fonbet")],
+        [InlineKeyboardButton("📊⚽ Футбол (SofaScore)",   callback_data="hunt_setup:football:sofascore")],
+        [InlineKeyboardButton("« Назад", callback_data="hunt_menu")],
+    ]
+    await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def _show_hunt_setup(query, sport: str, source: str):
+    """^Выбор типа условия."""
+    if sport == "basketball":
+        stats_dict = BASKETBALL_STATS
+        if source == "fonbet":
+            # Fonbet: нет детальной статистики — все на основе счёта по четвертям
+            pass  # все BASKETBALL_STATS доступны
+    else:
+        stats_dict = FOOTBALL_STATS if source == "sofascore" else {"goals": FOOTBALL_STATS["goals"]}
+
+    src_label = SOURCE_LABELS.get(source, source)
+    sport_label = SPORTS.get(sport, {}).get("label", sport)
+    text = (
+        f"🎯 <b>Авто-охота</b>\n"
+        f"📡 {src_label} | {SPORTS.get(sport, {}).get('emoji', '')} {sport_label}\n\n"
+        f"📊 Выбери условие:"
+    )
+    buttons = []
+    row = []
+    for key, info in stats_dict.items():
+        row.append(InlineKeyboardButton(
+            f"{info['emoji']} {info['label']}",
+            callback_data=f"hunt_stat:{sport}:{source}:{key}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("« Назад", callback_data="hunt_new")])
+    await _safe_edit(query, text, InlineKeyboardMarkup(buttons))
+
+
+async def _show_hunt_threshold(query, context, sport: str, source: str, stat_key: str):
+    """^Выбор порога или быстрое создание."""
+    stat_info = (BASKETBALL_STATS if sport == "basketball" else FOOTBALL_STATS).get(stat_key, {})
+    label = stat_info.get("label", stat_key)
+
+    # Для even-типов сразу создаём
+    if stat_key in ("q1_even", "q2_even", "q1q2_even"):
+        rule_id = await db.add_hunt_rule(
+            user_id=query.from_user.id, chat_id=query.message.chat_id,
+            sport=sport, source=source,
+            stat_key=stat_key, operator="==", threshold=1,
+        )
+        src_label = SOURCE_LABELS.get(source, source)
+        sport_emoji = SPORTS.get(sport, {}).get("emoji", "")
+        await query.edit_message_text(
+            f"✅ <b>Авто-охота #{rule_id} запущена!</b>\n\n"
+            f"📡 {src_label}\n"
+            f"{sport_emoji} {_esc(label)}\n\n"
+            f"🔍 Бот проверяет каждый live-матч.\n"
+            f"Уведомление придёт когда условие сработает.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Ещё условие", callback_data="hunt_new")],
+                [InlineKeyboardButton("🎯 Мои охоты", callback_data="hunt_menu")],
+                [InlineKeyboardButton("🏠 Главная", callback_data="main_menu")],
+            ])
+        )
+        return
+
+    # Для остальных — сохраняем в context и предлагаем пресеты
+    context.user_data["pending_hunt"] = {"sport": sport, "source": source, "stat_key": stat_key}
+
+    presets_map = {
+        "corners":  ["> 5", "> 7", "> 9", "> 11"],
+        "goals":    ["> 1", "> 2", "> 3", ">= 4"],
+        "yellow":   ["> 2", "> 3", "> 4", "> 5"],
+        "fouls":    ["> 10", "> 15", "> 20", "> 25"],
+        "points":   ["> 150", "> 180", "> 200", "> 220"],
+        "q1_total": ["> 40", "> 45", "> 50", "> 55"],
+        "q2_total": ["> 40", "> 45", "> 50", "> 55"],
+        "q3_total": ["> 40", "> 45", "> 50", "> 55"],
+        "q4_total": ["> 40", "> 45", "> 50", "> 55"],
+        "half1":    ["> 90", "> 100", "> 110", "> 120"],
+    }
+    presets = presets_map.get(stat_key, ["> 3", "> 5", "> 8", "> 10"])
+    src_label = SOURCE_LABELS.get(source, source)
+    buttons = []
+    row = []
+    for p in presets:
+        row.append(InlineKeyboardButton(
+            p, callback_data=f"hunt_quick:{sport}:{source}:{stat_key}:{p}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("« Назад", callback_data=f"hunt_setup:{sport}:{source}")])
+    await query.edit_message_text(
+        f"🎯 <b>Авто-охота</b>\n"
+        f"📡 {src_label} | 📊 <b>{_esc(label)}</b>\n\n"
+        f"Выбери порог или напиши своё:\n<code>&gt; 8</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def _handle_hunt_quick(query, sport: str, source: str, stat_key: str, condition: str):
+    """^Быстрое создание правила из пресета."""
+    parts = condition.split()
+    oper, threshold = parts[0], float(parts[1])
+    rule_id = await db.add_hunt_rule(
+        user_id=query.from_user.id, chat_id=query.message.chat_id,
+        sport=sport, source=source,
+        stat_key=stat_key, operator=oper, threshold=threshold,
+    )
+    stat_info = (BASKETBALL_STATS if sport == "basketball" else FOOTBALL_STATS).get(stat_key, {})
+    stat_label = stat_info.get("label", stat_key)
+    src_label = SOURCE_LABELS.get(source, source)
+    sport_emoji = SPORTS.get(sport, {}).get("emoji", "")
+    await query.edit_message_text(
+        f"✅ <b>Авто-охота #{rule_id} запущена!</b>\n\n"
+        f"📡 {src_label}\n"
+        f"{sport_emoji} {_esc(stat_label)} {oper} {threshold}\n\n"
+        f"🔍 Бот проверяет каждый live-матч.\n"
+        f"Уведомление придёт когда условие сработает.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎯 Ещё условие", callback_data="hunt_new")],
+            [InlineKeyboardButton("🎯 Мои охоты", callback_data="hunt_menu")],
+            [InlineKeyboardButton("🏠 Главная", callback_data="main_menu")],
+        ])
+    )
+
+
+# ═══════════════════════════════════════════════════════
 #  WEB
 # ═══════════════════════════════════════════════════════
 
@@ -1355,6 +1558,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             await _show_my_alerts(query)
 
+        elif data == "hunt_menu":
+            await _show_hunt_menu(query, query.from_user.id)
+
+        elif data == "hunt_new":
+            await _show_hunt_new(query)
+
+        elif data.startswith("hunt_setup:"):
+            # hunt_setup:sport:source
+            parts = data.split(":")
+            await _show_hunt_setup(query, parts[1], parts[2])
+
+        elif data.startswith("hunt_stat:"):
+            # hunt_stat:sport:source:stat_key
+            parts = data.split(":")
+            await _show_hunt_threshold(query, context, parts[1], parts[2], parts[3])
+
+        elif data.startswith("hunt_quick:"):
+            # hunt_quick:sport:source:stat_key:condition
+            parts = data.split(":", 5)
+            await _handle_hunt_quick(query, parts[1], parts[2], parts[3], parts[4])
+
+        elif data.startswith("hunt_stop:"):
+            rule_id = int(data.split(":")[1])
+            ok = await db.deactivate_hunt_rule(rule_id, query.from_user.id)
+            try:
+                await query.answer(f"Охота #{rule_id} остановлена ✅" if ok else "Не найдено", show_alert=True)
+            except Exception:
+                pass
+            await _show_hunt_menu(query, query.from_user.id)
+
+        elif data == "hunt_stop_all":
+            n = await db.clear_all_user_hunt_rules(query.from_user.id)
+            try:
+                await query.answer(f"Остановлено {n} охот ✅", show_alert=True)
+            except Exception:
+                pass
+            await _show_hunt_menu(query, query.from_user.id)
+
         elif data == "help":
             await _show_help(query)
 
@@ -1415,6 +1656,44 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверяем pending_hunt в первую очередь
+    pending_hunt = context.user_data.get("pending_hunt")
+    if pending_hunt:
+        text = update.message.text.strip()
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text("❌ Формат: <code>&gt; 8</code>", parse_mode=ParseMode.HTML)
+            return
+        oper = parts[0]
+        if oper not in SUPPORTED_OPERATORS:
+            await update.message.reply_text("❌ Оператор: > < >= <= ==")
+            return
+        try:
+            threshold = float(parts[1])
+        except ValueError:
+            await update.message.reply_text("❌ Значение должно быть числом.")
+            return
+        sport = pending_hunt["sport"]
+        source = pending_hunt["source"]
+        stat_key = pending_hunt["stat_key"]
+        rule_id = await db.add_hunt_rule(
+            user_id=update.effective_user.id, chat_id=update.effective_chat.id,
+            sport=sport, source=source,
+            stat_key=stat_key, operator=oper, threshold=threshold,
+        )
+        context.user_data.pop("pending_hunt", None)
+        stat_info = (BASKETBALL_STATS if sport == "basketball" else FOOTBALL_STATS).get(stat_key, {})
+        stat_label = stat_info.get("label", stat_key)
+        src_label = SOURCE_LABELS.get(source, source)
+        await update.message.reply_text(
+            f"✅ <b>Авто-охота #{rule_id} запущена!</b>\n"
+            f"📡 {src_label}\n"
+            f"📊 {stat_label} {oper} {threshold}\n"
+            f"🔍 Бот проверяет каждый live-матч.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     pending = context.user_data.get("pending_alert")
     if not pending:
         await _show_main_menu(update.message)
@@ -1591,6 +1870,12 @@ async def poll_and_check(context: ContextTypes.DEFAULT_TYPE):
             if tasks:
                 await asyncio.gather(*tasks)
 
+            # Авто-охота
+            hunt_rules = await db.get_all_active_hunt_rules()
+            if hunt_rules:
+                tasks_hunt = [_poll_hunt(context, hunt_rules)]
+                await asyncio.gather(*tasks_hunt)
+
             api.cleanup_cache()
             fb.cleanup_cache()
             logger.info(
@@ -1666,6 +1951,11 @@ async def _poll_sofascore_basketball(context, alerts_by_fixture: dict):
 
         parsed = api.parse_basketball_scores(ev)
         for alert in alerts:
+            # Автодеактивация: условие уже точно не пройдёт
+            if alert_is_impossible(alert, parsed):
+                await db.deactivate_alert_by_id(alert["id"])
+                logger.debug("SS basketball alert #%d auto-deactivated (impossible)", alert["id"])
+                continue
             triggered, value, extra = check_basketball_alert(alert, parsed)
             if extra and "expired" in extra.lower():
                 await db.deactivate_alert_by_id(alert["id"])
@@ -1717,6 +2007,11 @@ async def _poll_fonbet_basketball(context, alerts_by_fixture: dict):
 
         parsed = fb.parse_basketball_scores(ev)
         for alert in alerts:
+            # Автодеактивация: условие уже точно не пройдёт
+            if alert_is_impossible(alert, parsed):
+                await db.deactivate_alert_by_id(alert["id"])
+                logger.debug("FB basketball alert #%d auto-deactivated (impossible)", alert["id"])
+                continue
             triggered, value, extra = check_basketball_alert(alert, parsed)
             if extra and "expired" in extra.lower():
                 await db.deactivate_alert_by_id(alert["id"])
@@ -1775,6 +2070,115 @@ async def _poll_fonbet_football(context, alerts_by_fixture: dict):
                 msg = msg.replace("АЛЕРТ СРАБОТАЛ!", "АЛЕРТ СРАБОТАЛ!\n📡 Fonbet 🎰")
                 await _send_html_message(context.bot, alert["chat_id"], msg)
                 await db.mark_triggered(alert["id"], value, msg)
+
+
+async def _poll_hunt(context, hunt_rules: list[dict]):
+    """
+    Поллинг Авто-охоты: проверяет все live-матчи по каждому правилу.
+    Каждый матч обрабатывается только один раз: если сработало — triggered, нет — skipped.
+    """
+    # Сгруппируем правила по (source, sport)
+    by_source_sport: dict[tuple[str, str], list[dict]] = {}
+    for rule in hunt_rules:
+        key = (rule["source"], rule["sport"])
+        by_source_sport.setdefault(key, []).append(rule)
+
+    for (source, sport), rules in by_source_sport.items():
+        # Получаем live-матчи один раз для всех правил одной группы
+        if source == "fonbet":
+            if sport == "basketball":
+                events = await fb.basketball_live(include_esports=False)
+            else:
+                events = await fb.football_live(include_esports=False)
+        else:  # sofascore
+            if sport == "basketball":
+                events = await api.basketball_live()
+            else:
+                events = await api.football_live()
+
+        if not events:
+            continue
+
+        for ev in events:
+            fid = fb.get_event_id(ev) if source == "fonbet" else api.get_event_id(ev)
+
+            for rule in rules:
+                rule_id = rule["id"]
+
+                # Уже обрабатывали этот матч для этого правила?
+                if await db.hunt_fixture_seen(rule_id, fid):
+                    continue
+
+                # Парсим данные
+                if source == "fonbet" and sport == "basketball":
+                    parsed = fb.parse_basketball_scores(ev)
+                elif source == "sofascore" and sport == "basketball":
+                    parsed = api.parse_basketball_scores(ev)
+                else:
+                    parsed = None  # футбол
+
+                # Для баскетбола
+                if sport == "basketball" and parsed is not None:
+                    # Если условие уже невозможно — пропускаем матч
+                    if alert_is_impossible(rule, parsed):
+                        await db.hunt_mark_fixture(rule_id, fid, "expired")
+                        continue
+
+                    triggered, value, extra = check_basketball_alert(rule, parsed)
+
+                    if triggered:
+                        # Сработало!
+                        if source == "fonbet":
+                            msg = fb.format_notification(rule, value or 0, ev, extra)
+                            # Добавляем пометку авто-охоты
+                            msg = msg.replace("🔔 <b>АЛЕРТ СРАБОТАЛ!</b>",
+                                              "🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n🎯 <i>Авто-охота</i>")
+                        else:
+                            msg = format_basketball_notification(rule, value or 0, ev, extra)
+                            msg = msg.replace("🔔 <b>АЛЕРТ СРАБОТАЛ!</b>",
+                                              "🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n🎯 <i>Авто-охота</i>")
+                        await _send_html_message(context.bot, rule["chat_id"], msg)
+                        await db.hunt_mark_fixture(rule_id, fid, "triggered")
+
+                # Для футбола
+                elif sport == "football":
+                    if source == "fonbet":
+                        live_info = ev.get("_live_info")
+                        if not live_info:
+                            continue
+                        scores_arr = live_info.get("scores", [])
+                        total = scores_arr[0][0] if scores_arr and scores_arr[0] else {}
+                        home_goals = int(total.get("c1", 0))
+                        away_goals = int(total.get("c2", 0))
+                        synthetic_ev = {
+                            "homeScore": {"current": home_goals},
+                            "awayScore": {"current": away_goals},
+                            "homeTeam": {"name": fb.get_home_name(ev)},
+                            "awayTeam": {"name": fb.get_away_name(ev)},
+                            "status": {"type": "inprogress", "description": live_info.get("timer", "")},
+                        }
+                        if rule["stat_key"] != "goals":
+                            await db.hunt_mark_fixture(rule_id, fid, "skipped")
+                            continue
+                        triggered, value = check_football_alert(rule, {}, synthetic_ev)
+                        if triggered:
+                            msg = format_football_notification(rule, value, synthetic_ev)
+                            msg = msg.replace("🔔 <b>АЛЕРТ СРАБОТАЛ!</b>",
+                                              "🔔 <b>АЛЕРТ СРАБОТАЛ!</b>\n🎯 <i>Авто-охота</i>\n🎰 <i>Fonbet</i>")
+                            await _send_html_message(context.bot, rule["chat_id"], msg)
+                            await db.hunt_mark_fixture(rule_id, fid, "triggered")
+                    else:  # sofascore football
+                        stats = await api.football_statistics(fid)
+                        triggered, value = check_football_alert(rule, stats, ev)
+                        if triggered:
+                            msg = format_football_notification(rule, value, ev)
+                            msg = msg.replace("🔔 <b>АЛЕРТ СРАБОТАЛ!</b>",
+                                              "🔔 <b>АЛЕРТ СРАБОТаЛ!</b>\n🎯 <i>Авто-охота</i>")
+                            await _send_html_message(context.bot, rule["chat_id"], msg)
+                            await db.hunt_mark_fixture(rule_id, fid, "triggered")
+
+    # Периодическая чистка старых записей
+    await db.hunt_cleanup_seen(max_age_hours=48)
 
 
 # ═══════════════════════════════════════════════════════
