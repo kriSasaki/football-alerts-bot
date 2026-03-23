@@ -26,9 +26,18 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ─── Конфигурация ──────────────────────────────────────
-FONBET_BASE = "https://line-lb54-w.bk6bba-resources.com/ma"
+# Несколько зеркал на случай блокировки одного из них
+_FONBET_MIRRORS = [
+    "https://line-lb52-w.bk6bba-resources.ru/ma",   # .ru - работает без SSL ошибок
+    "https://line-lb61-w.bk6bba-resources.com/ma",
+    "https://line-lb54-w.bk6bba-resources.com/ma",
+    "https://line-lb51-w.bk6bba-resources.com/ma",
+]
+FONBET_BASE = _FONBET_MIRRORS[0]  # текущее активное зеркало
 FONBET_SCOPE = "1600"
 FONBET_LANG = "ru"
+
+_mirror_index = 0  # индекс текущего зеркала
 
 # ID спорта в Fonbet: 1=Футбол, 3=Баскетбол
 FONBET_SPORT_IDS = {
@@ -86,7 +95,14 @@ class _Cache:
             data, ts = self._store[key]
             if time.time() - ts < ttl:
                 return data
-            del self._store[key]
+        return None
+
+    def get_stale(self, key: str, max_age: float = 120):
+        """Вернуть устаревшие данные если все зеркала недоступны."""
+        if key in self._store:
+            data, ts = self._store[key]
+            if time.time() - ts < max_age:
+                return data
         return None
 
     def set(self, key: str, data):
@@ -108,17 +124,42 @@ def cleanup_cache():
 
 # ─── HTTP ───────────────────────────────────────────────
 async def _get(endpoint: str, params: dict | None = None) -> dict | None:
-    url = f"{FONBET_BASE}/{endpoint}"
+    """GET с автоматической ротацией зеркал при ошибке."""
+    global _mirror_index, FONBET_BASE
+
     default_params = {"lang": FONBET_LANG, "scopeMarket": FONBET_SCOPE}
     if params:
         default_params.update(params)
 
+    # Пробуем все зеркала по очереди, начиная с текущего
+    for attempt in range(len(_FONBET_MIRRORS)):
+        mirror = _FONBET_MIRRORS[(_mirror_index + attempt) % len(_FONBET_MIRRORS)]
+        url = f"{mirror}/{endpoint}"
+        try:
+            result = await _do_get(url, default_params)
+            if result is not None:
+                # Успех — запоминаем рабочее зеркало
+                if attempt > 0:
+                    _mirror_index = (_mirror_index + attempt) % len(_FONBET_MIRRORS)
+                    FONBET_BASE = mirror
+                    logger.info("Fonbet: switched to mirror %s", mirror)
+                return result
+        except Exception as e:
+            logger.debug("Fonbet mirror %s failed: %s", mirror, e)
+            continue
+
+    logger.warning("Fonbet: all mirrors unavailable for %s", endpoint)
+    return None
+
+
+async def _do_get(url: str, params: dict) -> dict | None:
+    """Один HTTP-запрос без retry."""
     try:
         if _USE_CURL:
             sess = await _get_session()
-            resp = await sess.get(url, params=default_params, headers=_HEADERS)
+            resp = await sess.get(url, params=params, headers=_HEADERS)
             if resp.status_code != 200:
-                logger.warning("Fonbet %s → %s", url, resp.status_code)
+                logger.debug("Fonbet %s → %s", url, resp.status_code)
                 return None
             return resp.json()
         else:
@@ -131,17 +172,17 @@ async def _get(endpoint: str, params: dict | None = None) -> dict | None:
                 ssl_ctx = ssl.create_default_context()
             async with aiohttp.ClientSession() as s:
                 async with s.get(
-                    url, headers=_HEADERS, params=default_params,
+                    url, headers=_HEADERS, params=params,
                     timeout=aiohttp.ClientTimeout(total=15),
                     ssl=ssl_ctx,
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning("Fonbet %s → %s", url, resp.status)
+                        logger.debug("Fonbet %s → %s", url, resp.status)
                         return None
                     return await resp.json()
     except Exception as e:
-        logger.error("Fonbet request error %s: %s", url, e)
-        return None
+        # Поднимаем исключение чтобы _get мог переключиться на следующее зеркало
+        raise
 
 
 # ─── Вспомогательные функции ────────────────────────────
@@ -230,24 +271,79 @@ def _parse_quarter_scores(live_info: dict | None) -> dict:
         last_sub = subscores[-1]
         current_period = period_map.get(str(last_sub.get("kindId", "")), 0)
 
+    # Определяем сколько четвертей реально СЫГРАНО по scoreComment
+    # scoreComment выглядит так: "(19-29 31-31 22-34)" — 3 завершённых четверти
+    # Если Q4 = 0-0 и она не в subscores — это ещё не сыгранная четверть
+    score_comment = live_info.get("scoreComment", "")
+    played_quarters = len(score_comment.split()) if score_comment else 0
+    # scoreComment содержит только завершённые или текущую четверть
+    # Точнее: считаем элементы в quarter_arr у которых хотя бы один не-нулевой
+    # ИЛИ которые соответствуют current_period
+    def _is_real_quarter(q_idx: int) -> bool:
+        """Проверяет, что данные по четверти реальные, а не заглушка 0-0."""
+        if home_q[q_idx] is None and away_q[q_idx] is None:
+            return False  # нет данных вообще
+        h = home_q[q_idx] or 0
+        a = away_q[q_idx] or 0
+        # Четверть реальна если: есть ненулевые очки, ИЛИ это текущая активная четверть
+        if h > 0 or a > 0:
+            return True
+        if current_period == q_idx + 1:
+            return True  # текущая четверть, пока 0-0 — реальна
+        return False  # 0-0 и не активная — это заглушка Fonbet
+
     timer_str = live_info.get("timer", "")
-    timer_seconds = live_info.get("timerSeconds", 0)
+    timer_seconds_raw = live_info.get("timerSeconds", 0) or 0
+    # timerSeconds у Fonbet = секунды С НАЧАЛА МАТЧА (нарастающий, для обоих direction)
+    # basketball_period_alert_is_fresh ждёт секунды С НАЧАЛА ТЕКУЩЕЙ четверти
+    # elapsed_in_quarter = total_seconds - (current_period - 1) * quarter_duration
+    _QUARTER_SECONDS = 600  # 10 минут по умолчанию
+    if current_period >= 1:
+        timer_seconds = max(0, timer_seconds_raw - (current_period - 1) * _QUARTER_SECONDS)
+    else:
+        timer_seconds = timer_seconds_raw
 
     def _quarter_finished(q_idx: int) -> bool:
-        if home_q[q_idx] is None:
-            return False
+        if not _is_real_quarter(q_idx):
+            return False  # данных нет или это заглушка
         if current_period == q_idx + 1:
-            return False  # эта четверть ещё идёт
+            return False  # эта четверть сейчас идёт
         if current_period > q_idx + 1:
-            return True   # следующая уже началась — предыдущая завершена
-        if current_period == 0 and home_q[q_idx] is not None:
-            return True   # нет активной — значит матч окончен
-        return False
+            return True   # следующая уже началась — эта завершена
+        # current_period == 0: перерыв или матч окончен
+        # Четверть завершена если она не заглушка (проверено выше)
+        return True
 
     q1_finished = _quarter_finished(0)
     q2_finished = _quarter_finished(1)
     q3_finished = _quarter_finished(2)
     q4_finished = _quarter_finished(3)
+
+    # Сбрасываем заглушки в None чтобы они не вшли в тоталы
+    for i in range(4):
+        if not _is_real_quarter(i):
+            home_q[i] = None
+            away_q[i] = None
+
+    # Пересчитываем q_totals уже с очищенными данными
+    for i in range(4):
+        if home_q[i] is not None and away_q[i] is not None:
+            q_totals[i] = home_q[i] + away_q[i]
+        else:
+            q_totals[i] = None
+
+    # Обновляем q_even и q1q2_even с очищенными данными
+    q_even = [qt % 2 == 0 if qt is not None else None for qt in q_totals]
+    q1q2_even = (
+        (q_even[0] and q_even[1])
+        if (q_even[0] is not None and q_even[1] is not None)
+        else None
+    )
+    half1 = (
+        (q_totals[0] + q_totals[1])
+        if (q_totals[0] is not None and q_totals[1] is not None)
+        else None
+    )
 
     home_total_int = home_total if home_total is not None else sum(q for q in home_q if q is not None)
     away_total_int = away_total if away_total is not None else sum(q for q in away_q if q is not None)
@@ -282,7 +378,9 @@ async def _fetch_all() -> dict | None:
     data = await _get("events/listBase")
     if data:
         _cache.set("fonbet_all", data)
-    return data
+        return data
+    # Все зеркала недоступны — возвращаем устаревшие данные если есть (не старше 2 мин)
+    return _cache.get_stale("fonbet_all", max_age=120)
 
 
 def _enrich_events(data: dict, sport_key: str) -> list[dict]:
