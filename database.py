@@ -98,7 +98,6 @@ async def init_db():
     """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active, fixture_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON alerts(user_id, active)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts(active, source)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_web_push_user ON web_push_subscriptions(user_id)")
     # Миграции для существующих БД
     for sql in [
@@ -110,6 +109,8 @@ async def init_db():
         "ALTER TABLE alert_history ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
         "ALTER TABLE alert_history ADD COLUMN source TEXT NOT NULL DEFAULT 'sofascore'",
         "ALTER TABLE web_push_subscriptions ADD COLUMN user_agent TEXT DEFAULT ''",
+        # Индекс по source — только после миграции колонки
+        "CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts(active, source)",
     ]:
         try:
             await db.execute(sql)
