@@ -1,6 +1,6 @@
 """
 Async SQLite database for storing user alerts and notification history.
-v2: added bulk alert support and alert stats query.
+v3: added source field (sofascore/fonbet), user_settings table.
 """
 import asyncio
 import time
@@ -47,6 +47,7 @@ async def init_db():
             user_id     INTEGER NOT NULL,
             chat_id     INTEGER NOT NULL,
             sport       TEXT    NOT NULL DEFAULT 'football',
+            source      TEXT    NOT NULL DEFAULT 'sofascore',
             fixture_id  INTEGER NOT NULL,
             stat_key    TEXT    NOT NULL,
             operator    TEXT    NOT NULL,
@@ -68,6 +69,7 @@ async def init_db():
             fixture_id  INTEGER NOT NULL,
             user_id     INTEGER NOT NULL,
             sport       TEXT    NOT NULL DEFAULT 'football',
+            source      TEXT    NOT NULL DEFAULT 'sofascore',
             stat_key    TEXT    NOT NULL,
             value       REAL,
             message     TEXT,
@@ -85,15 +87,28 @@ async def init_db():
             updated_at  REAL    NOT NULL
         )
     """)
+    # Настройки пользователя: источник данных, фильтр киберспорта и т.д.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id     INTEGER PRIMARY KEY,
+            data_source TEXT    NOT NULL DEFAULT 'sofascore',
+            hide_esports INTEGER DEFAULT 1,
+            updated_at  REAL    NOT NULL
+        )
+    """)
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(active, fixture_id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON alerts(user_id, active)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_source ON alerts(active, source)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_web_push_user ON web_push_subscriptions(user_id)")
+    # Миграции для существующих БД
     for sql in [
         "ALTER TABLE alerts ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
+        "ALTER TABLE alerts ADD COLUMN source TEXT NOT NULL DEFAULT 'sofascore'",
         "ALTER TABLE alerts ADD COLUMN kickoff_at REAL DEFAULT 0",
         "ALTER TABLE alerts ADD COLUMN match_label TEXT DEFAULT ''",
         "ALTER TABLE alerts ADD COLUMN overdue_notified INTEGER DEFAULT 0",
         "ALTER TABLE alert_history ADD COLUMN sport TEXT NOT NULL DEFAULT 'football'",
+        "ALTER TABLE alert_history ADD COLUMN source TEXT NOT NULL DEFAULT 'sofascore'",
         "ALTER TABLE web_push_subscriptions ADD COLUMN user_agent TEXT DEFAULT ''",
     ]:
         try:
@@ -103,19 +118,53 @@ async def init_db():
     await db.commit()
 
 
+# ─── User Settings ──────────────────────────────────────
+
+async def get_user_settings(user_id: int) -> dict:
+    db = await _get_db()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
+    )
+    if rows:
+        return dict(rows[0])
+    # Дефолт
+    return {"user_id": user_id, "data_source": "sofascore", "hide_esports": 1}
+
+
+async def set_user_setting(user_id: int, key: str, value) -> None:
+    """Обновить одну настройку пользователя. key: data_source | hide_esports"""
+    db = await _get_db()
+    now = time.time()
+    # Upsert
+    await db.execute(
+        """INSERT INTO user_settings (user_id, data_source, hide_esports, updated_at)
+           VALUES (?, 'sofascore', 1, ?)
+           ON CONFLICT(user_id) DO NOTHING""",
+        (user_id, now),
+    )
+    await db.execute(
+        f"UPDATE user_settings SET {key} = ?, updated_at = ? WHERE user_id = ?",
+        (value, now, user_id),
+    )
+    await db.commit()
+
+
+# ─── Alerts ────────────────────────────────────────────
+
 async def add_alert(
     user_id: int, chat_id: int, fixture_id: int,
     stat_key: str, operator: str, threshold: float,
     team: str = "total", sport: str = "football",
+    source: str = "sofascore",
     kickoff_at: float = 0, match_label: str = "",
 ) -> int:
     db = await _get_db()
     cursor = await db.execute(
         """INSERT INTO alerts
-           (user_id, chat_id, sport, fixture_id, stat_key, operator,
+           (user_id, chat_id, sport, source, fixture_id, stat_key, operator,
             threshold, team, created_at, kickoff_at, match_label)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, chat_id, sport, fixture_id, stat_key, operator,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, chat_id, sport, source, fixture_id, stat_key, operator,
          threshold, team, time.time(), kickoff_at, match_label),
     )
     await db.commit()
@@ -126,6 +175,7 @@ async def add_alerts_bulk(
     user_id: int, chat_id: int, sport: str,
     matches: list[dict], stat_key: str, operator: str,
     threshold: float, team: str = "total",
+    source: str = "sofascore",
 ) -> list[int]:
     now = time.time()
     ids = []
@@ -133,10 +183,10 @@ async def add_alerts_bulk(
     for m in matches:
         cursor = await db.execute(
             """INSERT INTO alerts
-               (user_id, chat_id, sport, fixture_id, stat_key, operator,
+               (user_id, chat_id, sport, source, fixture_id, stat_key, operator,
                 threshold, team, created_at, kickoff_at, match_label)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (user_id, chat_id, sport, m["fixture_id"], stat_key, operator,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, chat_id, sport, source, m["fixture_id"], stat_key, operator,
              threshold, team, now, m.get("kickoff_at", 0), m.get("match_label", "")),
         )
         ids.append(cursor.lastrowid)
@@ -158,24 +208,32 @@ async def get_active_alerts(fixture_id: int | None = None, sport: str | None = N
     return [dict(r) for r in rows]
 
 
-async def get_active_alerts_snapshot() -> dict[str, dict[int, list[dict]]]:
+async def get_active_alerts_snapshot() -> dict:
+    """
+    Возвращает snapshot всех активных алертов, сгруппированных по source и sport:
+    {
+      "sofascore": { "football": {fixture_id: [alert, ...]}, "basketball": {...} },
+      "fonbet":    { "basketball": {fixture_id: [alert, ...]}, ... },
+    }
+    """
     db = await _get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM alerts WHERE active = 1 ORDER BY sport, fixture_id, id"
+        "SELECT * FROM alerts WHERE active = 1 ORDER BY source, sport, fixture_id, id"
     )
-    snapshot: dict[str, dict[int, list[dict]]] = {}
+    snapshot: dict = {}
     for row in rows:
         alert = dict(row)
+        source = alert.get("source", "sofascore")
         sport = alert.get("sport", "football")
         fixture_id = alert["fixture_id"]
-        snapshot.setdefault(sport, {}).setdefault(fixture_id, []).append(alert)
+        snapshot.setdefault(source, {}).setdefault(sport, {}).setdefault(fixture_id, []).append(alert)
     return snapshot
 
 
 async def get_user_alerts(user_id: int) -> list[dict]:
     db = await _get_db()
     rows = await db.execute_fetchall(
-        "SELECT * FROM alerts WHERE user_id = ? AND active = 1 ORDER BY kickoff_at ASC",
+        "SELECT * FROM alerts WHERE user_id = ? AND active = 1 ORDER BY source, kickoff_at ASC",
         (user_id,),
     )
     return [dict(r) for r in rows]
@@ -200,9 +258,10 @@ async def mark_triggered(alert_id: int, value: float, message: str):
     )
     await db.execute(
         """INSERT INTO alert_history
-           (alert_id, fixture_id, user_id, sport, stat_key, value, message, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (alert_id, alert["fixture_id"], alert["user_id"], alert.get("sport", "football"),
+           (alert_id, fixture_id, user_id, sport, source, stat_key, value, message, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (alert_id, alert["fixture_id"], alert["user_id"],
+         alert.get("sport", "football"), alert.get("source", "sofascore"),
          alert["stat_key"], value, message, now),
     )
     await db.commit()
@@ -228,44 +287,18 @@ async def deactivate_alert_by_id(alert_id: int) -> bool:
     return cursor.rowcount > 0
 
 
-async def deactivate_fixture_alerts(fixture_id: int, sport: str = None):
+async def deactivate_fixture_alerts(fixture_id: int, sport: str = None, source: str = None):
     db = await _get_db()
+    query = "UPDATE alerts SET active=0 WHERE fixture_id=? AND active=1"
+    params = [fixture_id]
     if sport:
-        await db.execute(
-            "UPDATE alerts SET active=0 WHERE fixture_id=? AND sport=? AND active=1",
-            (fixture_id, sport),
-        )
-    else:
-        await db.execute(
-            "UPDATE alerts SET active=0 WHERE fixture_id=? AND active=1",
-            (fixture_id,),
-        )
+        query += " AND sport=?"
+        params.append(sport)
+    if source:
+        query += " AND source=?"
+        params.append(source)
+    await db.execute(query, params)
     await db.commit()
-
-
-async def get_watched_by_sport() -> dict[str, set[int]]:
-    now = time.time()
-    db = await _get_db()
-    rows = await db.execute_fetchall(
-        "SELECT DISTINCT sport, fixture_id FROM alerts WHERE active=1 AND kickoff_at <= ?",
-        (now,),
-    )
-    result: dict[str, set[int]] = {}
-    for row in rows:
-        sport = row["sport"]
-        fixture_id = row["fixture_id"]
-        result.setdefault(sport, set()).add(fixture_id)
-    return result
-
-
-async def get_overdue_alerts(tolerance_seconds: int) -> list[dict]:
-    cutoff = time.time() - tolerance_seconds
-    db = await _get_db()
-    rows = await db.execute_fetchall(
-        "SELECT * FROM alerts WHERE active=1 AND kickoff_at > 0 AND kickoff_at < ?",
-        (cutoff,),
-    )
-    return [dict(r) for r in rows]
 
 
 async def clear_all_user_alerts(user_id: int):
@@ -319,6 +352,8 @@ async def count_user_active_alerts(user_id: int) -> int:
     )
     return rows[0]["cnt"] if rows else 0
 
+
+# ─── Web Push ──────────────────────────────────────────
 
 async def save_web_push_subscription(user_id: int, endpoint: str, subscription_json: str, user_agent: str = ""):
     now = time.time()
