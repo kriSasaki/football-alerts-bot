@@ -263,13 +263,17 @@ def _parse_quarter_scores(live_info: dict | None) -> dict:
         else None
     )
 
-    # Текущая четверть из subscores
+    # Текущая четверть из subscores.
+    # subscores может содержать доп.статистику (трёхочковые и т.д.) — ищем
+    # ПЕРВЫЙ элемент с kindId из period_map, а не последний.
     subscores = live_info.get("subscores", [])
     period_map = {"100401": 1, "100402": 2, "100403": 3, "100404": 4}
     current_period = 0
-    if subscores:
-        last_sub = subscores[-1]
-        current_period = period_map.get(str(last_sub.get("kindId", "")), 0)
+    for sub in subscores:
+        p = period_map.get(str(sub.get("kindId", "")))
+        if p is not None:
+            current_period = p
+            break
 
     # Определяем сколько четвертей реально СЫГРАНО по scoreComment
     # scoreComment выглядит так: "(19-29 31-31 22-34)" — 3 завершённых четверти
@@ -535,8 +539,13 @@ def format_list_item(event: dict) -> str:
             h = total.get("c1", "?")
             a = total.get("c2", "?")
             subs = live_info.get("subscores", [])
-            period_map = {"100401": "Q1", "100402": "Q2", "100403": "Q3", "100404": "Q4"}
-            period = period_map.get(str(subs[-1]["kindId"]) if subs else "", "live") if subs else "live"
+            period_map_str = {"100401": "Q1", "100402": "Q2", "100403": "Q3", "100404": "Q4"}
+            period = "live"
+            for sub in subs:
+                p = period_map_str.get(str(sub.get("kindId", "")))
+                if p:
+                    period = p
+                    break
             timer = live_info.get("timer", "")
             return f"{home} {h}:{a} {away} | {period} {timer}"
         return f"{home} - {away} | live"

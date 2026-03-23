@@ -1916,6 +1916,20 @@ async def run_web_only():
         await _shutdown_core()
 
 
+async def _telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перехватывает сетевые ошибки Telegram и логирует их как WARNING вместо ERROR."""
+    err = context.error
+    if err is None:
+        return
+    err_str = str(err)
+    # Периодические сетевые сбои — не критично, бот сам восстановится
+    if any(x in err_str for x in ("ReadError", "ConnectError", "NetworkError", "TimedOut", "Timed out")):
+        logger.warning("Telegram network hiccup (auto-retry): %s", err_str[:120])
+        return
+    # Всё остальное — настоящая ошибка
+    logger.error("Telegram error: %s", err_str, exc_info=context.error)
+
+
 def main():
     if not TELEGRAM_ENABLED:
         asyncio.run(run_web_only())
@@ -1964,6 +1978,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_error_handler(_telegram_error_handler)
 
     app.job_queue.run_repeating(
         poll_and_check, interval=POLL_INTERVAL_SECONDS, first=5, name="poll_live_stats")
